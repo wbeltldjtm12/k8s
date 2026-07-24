@@ -17,3 +17,5 @@ venv/
 backend/chroma_db/
 
 *.log
+# Direct engine experiment artifacts
+engine-results/
