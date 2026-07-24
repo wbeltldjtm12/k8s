@@ -38,6 +38,14 @@ Worker
 └─ Pod
 ```
 
+> 📷 **이미지 1 삽입 위치**
+>
+> 여기에는 [Kubernetes Cluster Architecture 공식 SVG](https://kubernetes.io/images/docs/kubernetes-cluster-architecture.svg)를
+> 내려받아 넣는다. Control Plane과 Worker의 차이를 설명한 직후라 독자가
+> 실제 Kubernetes 구성요소를 한 번에 연결해서 보기 좋다.
+>
+> 캡션: *그림 1. Kubernetes 클러스터 구성요소. 출처: [Kubernetes 공식 문서](https://kubernetes.io/docs/concepts/architecture/)*
+
 ---
 
 ## 2. kubeadm, kubelet, kubectl의 차이
@@ -277,6 +285,14 @@ Tigera Operator
 설치할 때는 `kubeadm init`에서 지정한 Pod CIDR과 Calico의 IP pool CIDR이
 일치하는지 확인해야 한다. 또한 이 주소가 실제 LAN 대역과 겹치면 안 된다.
 
+> 📷 **이미지 2 삽입 위치**
+>
+> 여기에는 [Calico Component Architecture 공식 SVG](https://docs.tigera.io/assets/images/architecture-calico-deae813300e472483f84d6bfb49650ab.svg)를
+> 넣는다. 그림의 구성요소가 많으므로 전부 설명하기보다 이번 환경에서 확인한
+> `calico-node`, `kube-controllers`, API server를 중심으로 본다.
+>
+> 캡션: *그림 2. Calico 구성요소. 출처: [Calico 공식 문서](https://docs.tigera.io/calico/latest/reference/architecture/overview)*
+
 상태는 다음 명령으로 확인했다.
 
 ```bash
@@ -340,6 +356,13 @@ k8s-master    Ready    control-plane   v1.36.3
 k8s-worker1   Ready    <none>          v1.36.3
 k8s-worker2   Ready    <none>          v1.36.3
 ```
+
+> 📷 **이미지 3 삽입 위치**
+>
+> 이곳에는 직접 실행한 `kubectl get nodes -o wide` 결과 스크린샷을 넣는다.
+> 공식 구조도만 사용하는 것보다 실제로 세 노드가 `Ready`가 된 증거가 있어
+> 구축 기록으로서 설득력이 높아진다. 토큰, 사용자 이름 등 민감한 값이
+> 포함되지 않았는지 확인한 뒤 올린다.
 
 전체 시스템 Pod는 다음 명령으로 확인할 수 있다.
 
@@ -420,25 +443,13 @@ AI를 사용하지 않았다고 숨기기보다, **어디까지 도움을 받았
 
 ---
 
-## 글에 사용할 공식 구조도
+## 이미지 출처 정리
 
-직접 만든 그림보다 공식 설명과 정확히 연결되는 구조도 두 장을 사용하는
-편이 낫다고 판단했다.
+- [Kubernetes Cluster Architecture](https://kubernetes.io/docs/concepts/architecture/)
+- [Calico Component Architecture](https://docs.tigera.io/calico/latest/reference/architecture/overview)
 
-1. [Kubernetes Cluster Architecture 원본 SVG](https://kubernetes.io/images/docs/kubernetes-cluster-architecture.svg)
-   - Control Plane과 Worker Node의 구성요소를 설명하는 1절 뒤에 배치
-   - [그림이 실린 Kubernetes 공식 문서](https://kubernetes.io/docs/concepts/architecture/)
-
-2. [Calico Component Architecture 원본 SVG](https://docs.tigera.io/assets/images/architecture-calico-deae813300e472483f84d6bfb49650ab.svg)
-   - Tigera Operator와 Calico를 설명하는 8절 뒤에 배치
-   - [그림이 실린 Calico 공식 문서](https://docs.tigera.io/calico/latest/reference/architecture/overview)
-
-추가 후보로는 [Kubernetes Components 공식 SVG](https://kubernetes.io/images/docs/components-of-kubernetes.svg)가
-있지만 첫 번째 그림과 내용이 많이 겹치므로 둘 중 하나만 사용하는 것이
-좋다.
-
-이미지를 넣을 때는 그림 아래에 `출처: Kubernetes 공식 문서`처럼 원문
-페이지 링크를 함께 표기한다.
+> 실제 이미지를 넣은 뒤에는 본문의 `📷 이미지 삽입 위치` 안내 문구를
+> 삭제하고 캡션만 남긴다.
 
 ---
 
