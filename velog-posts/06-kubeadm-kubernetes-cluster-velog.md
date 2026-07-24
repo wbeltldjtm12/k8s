@@ -306,6 +306,14 @@ Deployment, Pod, Service와 장애 확인 방법을 정리할 예정이다.
 질문했다. 답변을 그대로 실행하기보다는 현재 서버 상태를 다시 확인하고,
 명령 실행 결과가 예상과 같은지 비교했다.
 
+기록을 다시 보니 특히 중요했던 질문은 다음과 같았다.
+
+- Kubernetes를 사용하려면 Docker를 반드시 설치해야 하는가?
+- master에서 이미지를 받으면 worker에도 자동으로 전달되는가?
+- Docker와 containerd의 이미지 목록이 왜 서로 다른가?
+- Tigera Operator와 Calico는 어떤 관계인가?
+- `sudo kubectl`은 왜 `localhost:8080`으로 접속하려 했는가?
+
 특히 `sudo kubectl`의 kubeconfig 문제나 Docker와 containerd의 이미지
 저장소 차이를 파악하는 데 도움을 받았다. 반면 VM 디스크 용량처럼 처음
 생각한 값과 실제 값이 다른 경우도 있었기 때문에, AI의 설명과 내 기억만
