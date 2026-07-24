@@ -76,6 +76,35 @@ sudo ctr -n k8s.io images list
 
 세 명령은 서로 다른 이미지 저장 공간을 확인한다.
 
+### master에서 이미지를 받으면 worker에도 생길까?
+
+처음에는 master가 이미지를 받으면 클러스터 전체가 함께 사용하는 줄 알았다.
+하지만 컨테이너 이미지는 기본적으로 노드마다 따로 관리된다.
+
+```text
+개발 PC
+└─ Docker로 이미지 빌드
+       ↓ push
+Container Registry
+       ↓ pull
+Pod가 배치된 Worker의 containerd
+```
+
+master에서 `docker pull`을 실행해도 worker로 이미지가 자동 복사되지 않는다.
+Pod가 생성되면 Scheduler가 실행할 노드를 결정하고, 해당 노드의 kubelet과
+containerd가 Registry에서 필요한 이미지를 받는다.
+
+이때 `imagePullPolicy`에 따라 동작이 달라진다.
+
+| 값 | 동작 |
+| --- | --- |
+| `IfNotPresent` | 노드에 이미지가 없을 때 받는다 |
+| `Always` | Pod를 시작할 때 Registry의 이미지 정보를 확인한다 |
+| `Never` | Registry에서 받지 않고 노드의 로컬 이미지만 사용한다 |
+
+따라서 여러 Worker에서 동일한 애플리케이션을 실행하려면 이미지를 직접
+복사하기보다 Docker Hub 같은 Registry를 사용하는 편이 관리하기 쉽다.
+
 ---
 
 ## 4. 노드 기본 설정
@@ -136,6 +165,22 @@ SystemdCgroup = true
 
 containerd와 kubelet이 같은 systemd cgroup 체계를 사용하게 하기 위한
 설정이다.
+
+cgroup은 프로세스가 사용할 CPU와 메모리 같은 자원을 관리하는 Linux
+기능이다. Kubernetes에서 Pod에 resource request나 limit을 지정하면
+실제 제한은 이 계층에서 적용된다.
+
+kubelet과 containerd가 서로 다른 cgroup driver를 사용하면 동일한
+프로세스와 자원을 서로 다르게 해석할 수 있다. Ubuntu가 systemd를
+사용하므로 두 구성요소도 systemd 방식으로 맞췄다.
+
+containerd를 Kubernetes에서 사용하려면 CRI 기능도 활성화되어 있어야 한다.
+`config.toml`의 `disabled_plugins`에 `cri`가 들어 있지 않은지 확인했다.
+
+```bash
+grep -n "disabled_plugins" /etc/containerd/config.toml
+grep -n "SystemdCgroup" /etc/containerd/config.toml
+```
 
 ```bash
 sudo systemctl restart containerd
@@ -240,6 +285,45 @@ kubectl get pods -n calico-system
 kubectl get pods -n tigera-operator
 ```
 
+`TigeraStatus`는 Kubernetes 기본 리소스가 아니라 Tigera Operator가 추가한
+Custom Resource다. 출력은 다음처럼 해석할 수 있다.
+
+```text
+AVAILABLE=True
+└─ 현재 사용할 수 있는 상태
+
+PROGRESSING=True
+└─ 설치 또는 설정 변경이 진행 중
+
+DEGRADED=True
+└─ 일부 구성요소에 문제가 있는 상태
+```
+
+정상 상태라면 일반적으로 `AVAILABLE=True`, `PROGRESSING=False`,
+`DEGRADED=False`가 된다.
+
+### 노드가 NotReady일 때 확인한 순서
+
+Worker의 join이 성공했다고 해서 네트워크 구성까지 끝난 것은 아니다.
+노드가 `NotReady`라면 무작정 재설치하기보다 다음 순서로 확인했다.
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A -o wide
+kubectl get tigerastatus
+kubectl describe node <NODE_NAME>
+```
+
+확인할 핵심은 다음과 같다.
+
+1. kubelet이 Control Plane에 정상 등록됐는가?
+2. Calico Pod가 각 노드에서 실행 중인가?
+3. Pod IP가 의도한 CIDR에서 할당됐는가?
+4. Node의 `Conditions`와 Events에 네트워크 오류가 있는가?
+
+`NotReady`는 원인 그 자체가 아니라 현재 상태를 나타낸다. 따라서 상태
+문자열만 보고 재설치하기보다 Events와 관련 시스템 Pod를 함께 봐야 한다.
+
 ---
 
 ## 9. 최종 확인
@@ -336,10 +420,33 @@ AI를 사용하지 않았다고 숨기기보다, **어디까지 도움을 받았
 
 ---
 
+## 글에 사용할 공식 구조도
+
+직접 만든 그림보다 공식 설명과 정확히 연결되는 구조도 두 장을 사용하는
+편이 낫다고 판단했다.
+
+1. [Kubernetes Cluster Architecture 원본 SVG](https://kubernetes.io/images/docs/kubernetes-cluster-architecture.svg)
+   - Control Plane과 Worker Node의 구성요소를 설명하는 1절 뒤에 배치
+   - [그림이 실린 Kubernetes 공식 문서](https://kubernetes.io/docs/concepts/architecture/)
+
+2. [Calico Component Architecture 원본 SVG](https://docs.tigera.io/assets/images/architecture-calico-deae813300e472483f84d6bfb49650ab.svg)
+   - Tigera Operator와 Calico를 설명하는 8절 뒤에 배치
+   - [그림이 실린 Calico 공식 문서](https://docs.tigera.io/calico/latest/reference/architecture/overview)
+
+추가 후보로는 [Kubernetes Components 공식 SVG](https://kubernetes.io/images/docs/components-of-kubernetes.svg)가
+있지만 첫 번째 그림과 내용이 많이 겹치므로 둘 중 하나만 사용하는 것이
+좋다.
+
+이미지를 넣을 때는 그림 아래에 `출처: Kubernetes 공식 문서`처럼 원문
+페이지 링크를 함께 표기한다.
+
+---
+
 ## 참고 문서
 
 - [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
 - [Creating a cluster with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
+- [Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
 - [Calico Quickstart](https://docs.tigera.io/calico/latest/getting-started/kubernetes/quickstart)
 
 ## 게시 전 확인
