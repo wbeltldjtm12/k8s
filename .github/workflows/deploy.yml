@@ -1,0 +1,125 @@
+name: Build and deploy KUBEIN
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "cluster-port/docker-compose.cluster.yml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kubein-production
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_NAMESPACE: sch02
+
+jobs:
+  build:
+    name: Build ${{ matrix.component }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - backend
+          - frontend
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_NAMESPACE }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/kubein-${{ matrix.component }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/kubein-${{ matrix.component }}:latest
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          provenance: false
+
+  deploy:
+    name: Deploy on master
+    needs: build
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - kubein-master
+
+    steps:
+      - name: Check out deployment files
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_NAMESPACE }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check server configuration
+        env:
+          KUBEIN_ENV_FILE: /home/master/kubein-config/.env.cluster
+          KUBECONFIG_PATH: /home/master/.kube/config
+        run: |
+          set -euo pipefail
+          test -f "$KUBEIN_ENV_FILE"
+          test -r "$KUBECONFIG_PATH"
+          docker version
+          docker compose version
+
+      - name: Pull and restart KUBEIN
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          KUBEIN_ENV_FILE: /home/master/kubein-config/.env.cluster
+          KUBEIN_DATA_DIR: /home/master/kubein-data
+          KUBECONFIG_PATH: /home/master/.kube/config
+        run: |
+          set -euo pipefail
+          mkdir -p "$KUBEIN_DATA_DIR/chroma_db"
+          docker compose \
+            -p kubein \
+            -f cluster-port/docker-compose.cluster.yml \
+            config --quiet
+          docker compose \
+            -p kubein \
+            -f cluster-port/docker-compose.cluster.yml \
+            pull
+          docker compose \
+            -p kubein \
+            -f cluster-port/docker-compose.cluster.yml \
+            up -d --remove-orphans --wait --wait-timeout 180
+
+      - name: Verify deployment
+        run: |
+          set -euo pipefail
+          curl --retry 12 --retry-delay 5 --retry-connrefused \
+            -fsS http://127.0.0.1:8000/api/health
+          curl --retry 12 --retry-delay 5 --retry-connrefused \
+            -fsS http://127.0.0.1:8501/_stcore/health
+          docker compose \
+            -p kubein \
+            -f cluster-port/docker-compose.cluster.yml \
+            ps

@@ -1,0 +1,38 @@
+# master node (192.168.67.13)
+# Images are built by GitHub Actions and pulled by the self-hosted runner.
+
+services:
+  backend:
+    image: sch02/kubein-backend:${IMAGE_TAG:-latest}
+    container_name: kubein-backend
+    restart: unless-stopped
+
+    # Keep localhost:8000 compatible with the evaluation scripts.
+    network_mode: host
+
+    env_file:
+      - ${KUBEIN_ENV_FILE:-.env.cluster}
+
+    environment:
+      - KUBECONFIG=/root/.kube/config
+
+    volumes:
+      - ${KUBECONFIG_PATH:-/home/master/.kube/config}:/root/.kube/config:ro
+      - ${KUBEIN_DATA_DIR:-/home/master/kubein-data}/chroma_db:/app/chroma_db
+      - chroma_cache:/root/.cache/chroma
+
+  frontend:
+    image: sch02/kubein-frontend:${IMAGE_TAG:-latest}
+    container_name: kubein-frontend
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      - BACKEND_URL=${BACKEND_URL:-http://127.0.0.1:8000}
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  chroma_cache:

@@ -1,0 +1,16 @@
+# kube-prometheus-stack values for the KUBEIN lab cluster.
+# The chart version is pinned in .github/workflows/monitoring.yml.
+
+grafana:
+  enabled: false
+
+alertmanager:
+  enabled: false
+
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090
+
+  prometheusSpec:
+    retention: 7d

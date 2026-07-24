@@ -1,0 +1,436 @@
+{
+  "01-pod-kill": {
+    "target": "carts-db",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "carts-db",
+    "expected_rc_reason": "Unavailable",
+    "detectable": false,
+    "description": "carts-db Pod Kill",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "carts-db"
+      }
+    ],
+    "limit_reason": "PodChaos pod-kill 후 Pod가 즉시 재생성되어 스냅샷 시점에 복구됨"
+  },
+  "02-pod-failure": {
+    "target": "catalogue",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "catalogue",
+    "expected_rc_reason": "Unavailable",
+    "detectable": true,
+    "description": "catalogue Pod failure",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "catalogue"
+      }
+    ]
+  },
+  "02-pod-kill-ordersdb": {
+    "target": "orders-db",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "orders-db",
+    "expected_rc_reason": "Unavailable",
+    "detectable": false,
+    "description": "orders-db Pod kill",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "orders-db"
+      }
+    ],
+    "limit_reason": "PodChaos pod-kill 후 Pod가 즉시 재생성되어 스냅샷 시점에 복구됨"
+  },
+  "03-container-kill": {
+    "target": "orders",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "orders",
+    "expected_rc_reason": "Unavailable",
+    "detectable": false,
+    "description": "orders Container kill",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "orders"
+      }
+    ],
+    "limit_reason": "container-kill 후 컨테이너가 즉시 재시작되어 스냅샷 시점에 복구됨"
+  },
+  "04-bad-image": {
+    "target": "catalogue",
+    "expected_rc_kind": "ReplicaSet",
+    "expected_rc_name_contains": "catalogue",
+    "expected_rc_reason": "ReplicasMismatch",
+    "detectable": true,
+    "description": "catalogue Bad image",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "catalogue"
+      }
+    ]
+  },
+  "05-oomkill": {
+    "target": "orders",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "orders",
+    "expected_rc_reason": "Unavailable",
+    "detectable": true,
+    "description": "orders OOMKilled",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "orders"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "orders"
+      }
+    ]
+  },
+  "06-readiness-probe": {
+    "target": "payment",
+    "expected_rc_kind": "ReplicaSet",
+    "expected_rc_name_contains": "payment",
+    "expected_rc_reason": "ReplicasMismatch",
+    "detectable": true,
+    "description": "payment Readiness probe",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "payment"
+      }
+    ]
+  },
+  "08-secret-delete": {
+    "target": "catalogue-db",
+    "expected_rc_kind": "Secret",
+    "expected_rc_name_contains": "catalogue-db",
+    "expected_rc_reason": "Missing",
+    "detectable": true,
+    "description": "catalogue-db Secret delete",
+    "expected_affected": [
+      {
+        "kind": "Secret",
+        "name_contains": "catalogue-db"
+      },
+      {
+        "kind": "Pod",
+        "name_contains": "catalogue-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "catalogue"
+      }
+    ]
+  },
+  "09-bad-configmap": {
+    "target": "front-end",
+    "expected_rc_kind": "ReplicaSet",
+    "expected_rc_name_contains": "front-end",
+    "expected_rc_reason": "ReplicasMismatch",
+    "detectable": true,
+    "description": "front-end ConfigMap error",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "front-end"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "front-end"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "front-end"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "front-end"
+      }
+    ]
+  },
+  "10-bad-pvc": {
+    "target": "orders-db",
+    "expected_rc_kind": "PVC",
+    "expected_rc_name_contains": "orders-db",
+    "expected_rc_reason": "Missing",
+    "detectable": true,
+    "description": "orders-db PVC error",
+    "expected_affected": [
+      {
+        "kind": "PVC",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "Pod",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "orders-db"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "orders-db"
+      }
+    ]
+  },
+  "11-dns-error": {
+    "target": "shipping",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "shipping DNS error",
+    "expected_affected": []
+  },
+  "12-network-delay": {
+    "target": "payment",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "payment Network delay",
+    "expected_affected": []
+  },
+  "13-network-loss": {
+    "target": "front-end",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "front-end Network loss",
+    "expected_affected": []
+  },
+  "14-cpu-stress": {
+    "target": "shipping",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "shipping CPU stress",
+    "expected_affected": []
+  },
+  "15-io-delay": {
+    "target": "carts-db",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "carts-db IO delay",
+    "expected_affected": []
+  },
+  "16-selector-mismatch": {
+    "target": "user",
+    "expected_rc_kind": "Service",
+    "expected_rc_name_contains": "user",
+    "expected_rc_reason": "NoEndpoints",
+    "detectable": true,
+    "description": "user Selector mismatch",
+    "expected_affected": [
+      {
+        "kind": "Service",
+        "name_contains": "user"
+      }
+    ]
+  },
+  "17-memory-stress": {
+    "target": "shipping",
+    "expected_rc_kind": null,
+    "expected_rc_name_contains": null,
+    "expected_rc_reason": null,
+    "detectable": false,
+    "description": "shipping Memory stress",
+    "expected_affected": []
+  },
+  "18-cascade-carts": {
+    "target": "carts-db",
+    "expected_rc_kind": "Deployment",
+    "expected_rc_name_contains": "carts-db",
+    "expected_rc_reason": "Unavailable",
+    "detectable": false,
+    "description": "carts cascade",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "Pod",
+        "name_contains": "carts"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "carts"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "carts-db"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "carts"
+      }
+    ],
+    "limit_reason": "연쇄 pod-kill 후 Pod가 즉시 재생성되어 스냅샷 시점에 복구됨"
+  },
+  "19-cascade-secret": {
+    "target": "catalogue-db",
+    "expected_rc_kind": "Secret",
+    "expected_rc_name_contains": "catalogue-db",
+    "expected_rc_reason": "Missing",
+    "detectable": true,
+    "description": "catalogue-db cascade secret",
+    "expected_affected": [
+      {
+        "kind": "Secret",
+        "name_contains": "catalogue-db"
+      },
+      {
+        "kind": "Pod",
+        "name_contains": "catalogue-db"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "catalogue"
+      }
+    ]
+  },
+  "20-multi-fault": {
+    "target": "user/payment",
+    "expected_rc_kind": [
+      "ReplicaSet",
+      "Service"
+    ],
+    "expected_rc_name_contains": [
+      "payment",
+      "user"
+    ],
+    "expected_rc_reason": [
+      "ReplicasMismatch",
+      "NoEndpoints"
+    ],
+    "detectable": true,
+    "description": "multi fault",
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "payment"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "user"
+      }
+    ]
+  },
+  "07-liveness-probe": {
+    "description": "catalogue의 livenessProbe를 잘못된 경로로 변경하여 Pod가 반복 재시작됨",
+    "root_cause": "Pod/catalogue",
+    "root_cause_kind": "Pod",
+    "detectable": false,
+    "limit_reason": "Liveness 실패로 인한 재시작이 빠르게 반복되어 스냅샷 시점에 Running 상태"
+  }
+}
