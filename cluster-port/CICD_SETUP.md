@@ -1,13 +1,12 @@
 # KUBEIN CI/CD initial setup
 
-The repository contains two GitHub Actions workflows:
+The repository contains one GitHub Actions workflow:
 
 - `deploy.yml`: builds backend/frontend images, pushes commit and `latest`
   tags to Docker Hub, and deploys the commit tag on the master node.
-- `monitoring.yml`: installs or upgrades the pinned kube-prometheus-stack.
 
 Complete the secret and runner setup before the first push so the initial
-workflows do not fail or remain queued.
+workflow does not fail or remain queued.
 
 ## 1. Create an empty GitHub repository
 
@@ -51,7 +50,7 @@ KUBEINSIGHT_ENV=prod
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
 LLM_MODEL=gemini-2.5-flash
 LLM_API_KEY=replace-with-your-gemini-api-key
-PROMETHEUS_URL=http://192.168.67.13:30090
+PROMETHEUS_URL=http://192.168.0.12:30090
 ```
 
 Verify that the runner user can access Docker and Kubernetes:
@@ -99,7 +98,7 @@ git remote add origin https://github.com/OWNER/REPOSITORY.git
 git push -u origin main
 ```
 
-The first push starts both workflows. They can also be run manually from the
+The first push starts `deploy.yml`. It can also be run manually from the
 GitHub Actions page.
 
 Verify on the master:
@@ -108,7 +107,7 @@ Verify on the master:
 docker ps
 curl -fsS http://127.0.0.1:8000/api/health
 curl -fsS http://127.0.0.1:8501/_stcore/health
-curl -fsS http://192.168.67.13:30090/-/ready
+curl -fsS http://192.168.0.12:30090/-/ready
 ```
 
 Every later push to `main` that changes the backend, frontend, Compose file, or

@@ -15,7 +15,7 @@ from typing import List, Dict, Optional
 import requests
 
 
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://192.168.67.13:30090")
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://192.168.0.12:30090")
 
 
 @dataclass

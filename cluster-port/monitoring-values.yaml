@@ -1,5 +1,5 @@
 # kube-prometheus-stack values for the KUBEIN lab cluster.
-# The chart version is pinned in .github/workflows/monitoring.yml.
+# The chart version and manual command are documented in MONITORING.md.
 
 grafana:
   enabled: false

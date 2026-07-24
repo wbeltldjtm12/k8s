@@ -4,9 +4,9 @@
 
 | 호스트 | IP | 역할 |
 |--------|-----|------|
-| master | 192.168.67.13 | Control Plane — **백엔드 여기서 실행** |
-| worker1 | 192.168.67.11 | Worker Node |
-| worker2 | 192.168.67.12 | Worker Node |
+| master | 192.168.0.12 | Control Plane — **백엔드 여기서 실행** |
+| worker1 | 192.168.0.13 | Worker Node |
+| worker2 | 192.168.0.14 | Worker Node |
 
 > **아키텍처**: 백엔드(FastAPI)는 master에서 docker-compose로 실행.
 > sock-shop은 클러스터 전체(worker1/worker2)에 스케줄링됨.
@@ -19,14 +19,14 @@
 **Windows 노트북에서 실행:**
 ```powershell
 # PowerShell에서 현재 저장소 내용을 master의 ~/kubein으로 전송
-scp -r "C:\path\to\kubein" user@192.168.67.13:~/
+scp -r "C:\path\to\kubein" user@192.168.0.12:~/
 ```
 
 > `user` 부분은 master의 실제 리눅스 계정으로 변경 (예: `ubuntu`, `root`, `ch02` 등)
 
 **이후 모든 작업은 master에서 SSH로:**
 ```bash
-ssh user@192.168.67.13
+ssh user@192.168.0.12
 cd ~/kubein
 ```
 
