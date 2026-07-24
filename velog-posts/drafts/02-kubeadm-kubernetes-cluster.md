@@ -12,9 +12,19 @@
 > 다만 명령은 직접 실행했고, 결과를 확인하면서 이해한 내용을 이 글에
 > 다시 정리했다.
 
+이 글에서는 구축 과정에서 실제로 궁금했던 다음 질문을 따라간다.
+
+- Control Plane과 Worker는 각각 무엇을 하는가?
+- kubeadm, kubelet, kubectl은 어떻게 다른가?
+- Kubernetes에 Docker가 없어도 되는 이유는 무엇인가?
+- swap, 커널 모듈, IP forwarding은 왜 설정하는가?
+- Worker는 어떻게 Control Plane에 참가하는가?
+- CNI와 Calico가 없으면 왜 노드가 `NotReady`가 되는가?
+- 클러스터가 정상이라는 사실을 어떤 명령으로 확인하는가?
+
 ---
 
-## 1. 구성한 클러스터
+## 1. 구성한 클러스터와 범위
 
 | 호스트 | IP | 역할 |
 | --- | --- | --- |
@@ -24,6 +34,11 @@
 
 Control Plane은 클러스터의 상태를 관리하고 Pod를 어느 노드에 배치할지
 결정한다. Worker는 실제 애플리케이션 Pod가 실행되는 공간이다.
+
+이번 구성은 학습과 KUBEIN 실험을 위한 단일 Control Plane 환경이다.
+`k8s-master`가 중단되면 기존 컨테이너가 즉시 모두 사라지는 것은 아니지만,
+API 요청과 새로운 스케줄링 같은 클러스터 관리 기능은 사용할 수 없게 된다.
+따라서 고가용성을 갖춘 운영용 구성과는 다르다.
 
 ```text
 Control Plane
@@ -48,9 +63,11 @@ Worker
 
 ---
 
-## 2. kubeadm, kubelet, kubectl의 차이
+## 2. 클러스터를 구성하고 실행하는 세 도구
 
 처음에는 이름이 비슷해서 세 프로그램의 역할이 가장 헷갈렸다.
+
+> **질문:** kubeadm, kubelet, kubectl은 이름만 다른 같은 종류의 프로그램일까?
 
 - `kubeadm`: 클러스터를 처음 만들거나 노드를 참가시키는 도구
 - `kubelet`: 각 노드에서 Pod 상태를 관리하는 서비스
@@ -102,10 +119,12 @@ kubectl describe node k8s-worker1
 
 ---
 
-## 3. Docker 없이 containerd를 사용한 이유
+## 3. Docker가 없어도 되는 이유: CRI와 containerd
 
 Kubernetes가 컨테이너를 직접 실행하는 것은 아니다. kubelet은 CRI라는
 표준 인터페이스를 통해 컨테이너 런타임에 실행을 요청한다.
+
+> **질문:** Kubernetes를 설치하려면 모든 노드에 Docker부터 설치해야 할까?
 
 ```text
 kubelet → CRI → containerd → runc → 컨테이너
@@ -158,9 +177,11 @@ containerd가 Registry에서 필요한 이미지를 받는다.
 
 ---
 
-## 4. 노드 기본 설정
+## 4. 세 노드에 공통으로 적용한 사전 설정
 
 설정은 master와 worker 세 노드에 모두 적용했다.
+
+> **질문:** swap과 커널·네트워크 설정은 컨테이너 실행과 어떤 관계가 있을까?
 
 ### swap 비활성화
 
@@ -273,7 +294,7 @@ Kubernetes Node
 
 ---
 
-## 5. containerd와 Kubernetes 설치
+## 5. containerd와 Kubernetes 패키지 설치
 
 containerd를 설치한 뒤 기본 설정 파일을 생성했다.
 
@@ -365,9 +386,11 @@ kubectl version --client
 
 ---
 
-## 6. Control Plane 생성
+## 6. Control Plane 초기화
 
 `k8s-master`에서 다음과 같은 형태로 클러스터를 초기화했다.
+
+> **질문:** `kubeadm init` 한 번으로 내부에서는 어떤 작업이 진행될까?
 
 ```bash
 sudo kubeadm init \
@@ -439,9 +462,11 @@ context
 
 ---
 
-## 7. Worker Node 연결
+## 7. 두 Worker를 클러스터에 연결
 
 `kubeadm init` 결과로 출력된 join 명령을 두 Worker에서 실행했다.
+
+> **질문:** 새로운 Worker는 어떤 방식으로 Control Plane을 신뢰하고 참가할까?
 
 ```bash
 sudo kubeadm join 192.168.0.12:6443 \
@@ -490,11 +515,13 @@ sudo journalctl -u kubelet -n 100 --no-pager
 
 ---
 
-## 8. Calico 설치
+## 8. CNI로 Calico 설치
 
 Worker가 클러스터에 참가해도 CNI가 없으면 노드는 `NotReady` 상태일 수
 있다. Kubernetes는 Pod 배치를 관리하지만, Pod IP 할당과 노드 간 통신은
 CNI 플러그인이 담당하기 때문이다.
+
+> **질문:** join까지 성공했는데 노드는 왜 아직 `NotReady`일까?
 
 이번에는 Calico를 사용했다.
 
@@ -569,7 +596,7 @@ kubectl describe node <NODE_NAME>
 
 ---
 
-## 9. 최종 확인
+## 9. 세 노드가 Ready인지 검증
 
 ```bash
 kubectl get nodes
@@ -639,7 +666,7 @@ CrashLoopBackOff
 
 ---
 
-## 10. 이번에 이해한 전체 흐름
+## 10. 명령이 Pod 실행으로 이어지는 전체 흐름
 
 ```text
 kubectl
@@ -694,12 +721,9 @@ Node 자체가 불안정한가?
 └─ kubelet, 디스크, 메모리, 런타임 확인
 ```
 
-다음 글에서는 이 클러스터에 Sock Shop을 배포하면서 Namespace,
-Deployment, Pod, Service와 장애 확인 방법을 정리할 예정이다.
-
 ---
 
-## AI를 어떻게 활용했는가
+## 11. AI를 어떻게 활용했는가
 
 이번 작업에서는 AI에게 설치 순서, 명령어의 의미, 오류 메시지의 원인을
 질문했다. 답변을 그대로 실행하기보다는 현재 서버 상태를 다시 확인하고,
@@ -745,19 +769,24 @@ AI를 사용하지 않았다고 숨기기보다, **어디까지 도움을 받았
 
 ---
 
-## 복습할 질문
+## 12. 마치며
 
-1. kubeadm, kubelet, kubectl은 각각 무엇을 하는가?
-2. Kubernetes 노드에 Docker Engine이 없어도 되는 이유는 무엇인가?
-3. containerd와 runc는 어떤 관계인가?
-4. swap과 IP forwarding 설정은 왜 필요한가?
-5. CNI가 없으면 노드가 왜 `NotReady`가 되는가?
-6. Calico와 Tigera Operator는 어떤 관계인가?
-7. 일반 `kubectl`과 `sudo kubectl`의 결과가 달라지는 이유는 무엇인가?
+이번 구성에서 가장 크게 바뀐 생각은 Kubernetes를 하나의 프로그램으로
+보지 않게 된 것이다. 클러스터 구성은 kubeadm, 노드의 지속적인 관리는
+kubelet, 컨테이너 실행은 containerd, Pod 네트워크는 Calico가 담당했다.
+
+명령이 성공했다는 사실만으로 전체 시스템이 정상인 것도 아니었다.
+노드 등록, CNI 상태, 시스템 Pod, 실제 네트워크가 각각 정상인지 단계별로
+확인해야 했다.
+
+현재는 세 노드가 `Ready`인 기본 클러스터까지만 완성했다. 다음 글에서는
+Sock Shop을 배포하면서 Namespace, Deployment, ReplicaSet, Pod, Service가
+어떻게 연결되는지, 그리고 장애 상태를 어떤 순서로 확인하는지 정리할
+예정이다.
 
 ---
 
-## 이미지 출처 정리
+## 초안 작업 메모: 이미지 출처
 
 - [Kubernetes Cluster Architecture](https://kubernetes.io/docs/concepts/architecture/)
 - [Calico Component Architecture](https://docs.tigera.io/calico/latest/reference/architecture/overview)
