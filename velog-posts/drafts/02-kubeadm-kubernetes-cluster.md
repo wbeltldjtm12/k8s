@@ -2,10 +2,14 @@
 
 이전 글에서는 미니 PC에 Proxmox를 설치하고 Ubuntu VM 3대를 만들었다.
 
-이번 글은 그다음 과정이다. 준비한 VM에 containerd와 Kubernetes를 설치하고,
-Control Plane 1대와 Worker 2대를 하나의 클러스터로 묶었다.
+이제 이 VM 3대에 Kubernetes를 올릴 차례였다.
 
-실제로 진행한 순서는 다음과 같다.
+사실 시작할 때는 Docker부터 설치하고 명령어 몇 개만 입력하면 되는 줄
+알았다. 막상 해보니 containerd, CRI, CNI처럼 처음 보는 이름이 계속
+나왔고, Worker를 연결한 뒤에도 노드가 바로 정상 상태가 되지 않았다.
+
+그래서 이번 글에는 실제로 작업한 순서와 그때마다 헷갈렸던 내용을 같이
+적어보려고 한다.
 
 1. 세 VM의 역할과 IP 확인
 2. swap, 커널 모듈, 네트워크 설정
@@ -15,20 +19,14 @@ Control Plane 1대와 Worker 2대를 하나의 클러스터로 묶었다.
 6. Calico 설치
 7. 세 노드의 최종 상태 확인
 
-작업 중에는 Docker가 꼭 필요한지, CRI와 cgroup은 무엇인지,
-join이 성공했는데 왜 노드가 `NotReady`인지처럼 모르는 부분이 계속 나왔다.
-이 글에서는 질문과 답을 별도 문답으로 분리하지 않고, 실제 작업이 진행된
-순서 안에 함께 정리했다.
-
 > 환경: Ubuntu 22.04, Kubernetes v1.36.3, containerd, Calico v3.32.1
 >
-> 구축 과정에서는 생성형 AI의 도움을 받아 명령어와 오류 원인을 확인했다.
-> 다만 명령은 직접 실행했고, 결과를 확인하면서 이해한 내용을 이 글에
-> 다시 정리했다.
+> 모르는 내용은 생성형 AI에 물어보면서 진행했다. 명령어를 그대로 믿고
+> 넘기지는 않고, 서버에서 직접 실행한 결과와 공식 문서를 같이 확인했다.
 
 ---
 
-## 1. VM 세 대의 역할을 먼저 정했다
+## 1. VM 3대의 역할부터 정했다
 
 | 호스트 | IP | 역할 |
 | --- | --- | --- |
@@ -36,18 +34,24 @@ join이 성공했는데 왜 노드가 `NotReady`인지처럼 모르는 부분이
 | `k8s-worker1` | `192.168.0.13` | Worker |
 | `k8s-worker2` | `192.168.0.14` | Worker |
 
-Control Plane은 클러스터의 상태를 관리하고 Pod를 어느 노드에 배치할지
-결정한다. Worker는 실제 애플리케이션 Pod가 실행되는 공간이다.
+`k8s-master`는 클러스터를 관리하는 Control Plane으로, 나머지 두 대는
+실제 애플리케이션을 실행하는 Worker로 사용했다.
 
-이번 구성은 학습과 KUBEIN 실험을 위한 단일 Control Plane 환경이다.
-`k8s-master`가 중단되면 기존 컨테이너가 즉시 모두 사라지는 것은 아니지만,
-API 요청과 새로운 스케줄링 같은 클러스터 관리 기능은 사용할 수 없게 된다.
-따라서 고가용성을 갖춘 운영용 구성과는 다르다.
+Control Plane은 클러스터 상태를 관리하고 Pod를 어느 노드에 배치할지
+결정한다. Worker는 배정받은 Pod를 실제로 실행한다.
 
-여기서 **Node**는 Kubernetes 클러스터에 참가한 물리 서버나 VM을 뜻한다.
-**Pod**는 Kubernetes가 배포하고 관리하는 가장 작은 실행 단위로, 하나
-이상의 컨테이너와 네트워크·저장소 설정을 묶는다. 이번 글에서는 세 VM이
-Node가 되고, 다음 글부터 그 위에 애플리케이션 Pod를 올리게 된다.
+이번에는 공부와 KUBEIN 실험이 목적이라 Control Plane을 한 대만 구성했다.
+운영 환경처럼 장애에 대비한 고가용성 구성은 아니다. `k8s-master`가
+중단돼도 이미 실행 중인 컨테이너가 바로 전부 사라지는 것은 아니지만,
+새로운 명령을 받거나 Pod를 다시 배치하는 관리 기능에는 문제가 생긴다.
+
+여기서 **Node**는 Kubernetes 클러스터에 참가한 서버나 VM을 뜻한다.
+이번에는 VM 3대가 각각 하나의 Node가 된다.
+
+**Pod**는 Kubernetes가 관리하는 가장 작은 실행 단위다. 컨테이너 하나만
+들어갈 수도 있고, 필요하면 여러 컨테이너가 네트워크와 저장소를 공유할
+수도 있다. 일단 지금은 “컨테이너를 감싸서 Kubernetes가 관리하는 단위”
+정도로 이해했다.
 
 ```text
 Control Plane
@@ -62,7 +66,8 @@ Worker
 └─ Pod
 ```
 
-Control Plane 안의 이름도 처음에는 전부 비슷하게 보였다.
+Control Plane 안에도 여러 프로그램이 있었는데 처음에는 이름부터
+헷갈렸다. 내가 이해한 역할은 대충 다음과 같다.
 
 | 구성요소 | 하는 일 |
 | --- | --- |
@@ -83,22 +88,26 @@ Control Plane 안의 이름도 처음에는 전부 비슷하게 보였다.
 
 ---
 
-## 2. 클러스터를 구성하고 실행하는 세 도구
+## 2. kubeadm, kubelet, kubectl부터 구분했다
 
-처음에는 이름이 비슷해서 세 프로그램의 역할이 가장 헷갈렸다.
-설치하면서 확인해 보니 실행되는 시점과 대상부터 서로 달랐다.
+설치 문서를 보다 보니 `kubeadm`, `kubelet`, `kubectl`이 계속 나왔다.
+이름이 비슷해서 처음에는 셋 다 비슷한 설치 도구인 줄 알았다.
+
+막상 하나씩 찾아보니 역할이 전부 달랐다.
 
 - `kubeadm`: 클러스터를 처음 만들거나 노드를 참가시키는 도구
 - `kubelet`: 각 노드에서 Pod 상태를 관리하는 서비스
 - `kubectl`: 사용자가 Kubernetes API에 명령을 보내는 도구
 
-즉, `kubeadm`으로 클러스터를 만들고, `kubectl`로 명령을 내리면,
-각 노드의 `kubelet`이 실제 작업을 수행한다.
+`kubeadm`으로 클러스터를 만들고, 내가 `kubectl`로 명령을 보내면,
+각 Node에서 실행 중인 `kubelet`이 그 명령에 맞춰 Pod 상태를 관리한다.
 
-### kubeadm은 클러스터 bootstrap 도구다
+### kubeadm은 클러스터를 처음 만드는 도구
 
-`kubeadm`은 계속 실행되는 서버가 아니다. 클러스터를 처음 구성하거나
-노드를 추가하고 업그레이드할 때 실행하는 bootstrap 도구다.
+`kubeadm`은 백그라운드에서 계속 실행되는 프로그램이 아니다. 처음
+클러스터를 만들거나 다른 Node를 참가시킬 때 사용하는 도구다.
+
+문서에서는 이런 초기 구성 작업을 **bootstrap**이라고 부른다.
 
 ```text
 kubeadm init
@@ -108,12 +117,15 @@ kubeadm join
 └─ Worker를 기존 클러스터에 연결
 ```
 
-### kubelet은 각 노드에 상주한다
+### kubelet은 각 Node에서 계속 실행된다
 
-`kubelet`은 master와 worker에서 계속 실행되는 systemd 서비스다. systemd는
-Ubuntu에서 백그라운드 서비스의 시작·중지·자동 실행을 관리하는 프로그램이다.
-API Server로부터 현재 노드에 배정된 Pod 정보를 받고, 실제 상태가 원하는
-상태와 다르면 containerd에 컨테이너 생성이나 재시작을 요청한다.
+`kubelet`은 master와 worker에서 계속 실행되는 systemd 서비스다.
+**systemd**는 Ubuntu에서 백그라운드 서비스의 시작, 중지, 자동 실행을
+관리한다.
+
+kubelet은 API Server에서 현재 Node에 배정된 Pod 정보를 받아온다. 실제
+상태가 원하는 상태와 다르면 containerd에 컨테이너 생성이나 재시작을
+요청한다.
 
 ```text
 Control Plane
@@ -126,10 +138,11 @@ containerd
 컨테이너 실행
 ```
 
-### kubectl은 API를 사용하는 클라이언트다
+### kubectl은 내가 명령을 보낼 때 사용한다
 
-`kubectl`이 Worker에 직접 SSH로 접속하는 것은 아니다. kubeconfig에 기록된
-API Server 주소와 인증 정보를 사용해 요청을 보낸다.
+`kubectl`은 내가 터미널에서 사용하는 명령어 도구다. 처음에는 이 명령이
+Worker에 직접 접속하는 줄 알았는데, 실제로는 kubeconfig에 적힌 API Server
+주소로 요청을 보낸다.
 
 ```bash
 kubectl get nodes
@@ -139,18 +152,22 @@ kubectl describe node k8s-worker1
 
 ---
 
-## 3. Docker가 없어도 되는 이유: CRI와 containerd
+## 3. Docker 대신 containerd를 사용했다
 
-처음에는 Kubernetes를 사용하려면 모든 VM에 Docker를 먼저 설치해야 한다고
-생각했다. 하지만 Kubernetes가 컨테이너를 직접 실행하거나 Docker에만
-의존하는 것은 아니었다. kubelet은 CRI라는 표준 인터페이스를 통해
-containerd 같은 컨테이너 런타임에 실행을 요청한다.
+여기서 가장 먼저 헷갈린 것이 Docker였다.
+
+나는 Kubernetes로 컨테이너를 실행하려면 모든 VM에 Docker부터 설치해야
+한다고 생각했다. 그런데 이번 구성에서는 Docker Engine을 설치하지 않고
+containerd를 사용했다.
+
+Kubernetes가 컨테이너를 직접 실행하는 것은 아니다. kubelet이 CRI라는
+규칙을 통해 containerd 같은 컨테이너 런타임에 실행을 요청한다.
 
 ```text
 kubelet → CRI → containerd → runc → 컨테이너
 ```
 
-각 용어의 관계는 다음과 같이 이해했다.
+내가 이해한 관계는 다음과 같다.
 
 - **CRI(Container Runtime Interface)**: kubelet과 컨테이너 런타임이
   통신하기 위한 공통 규칙이다.
@@ -159,11 +176,12 @@ kubelet → CRI → containerd → runc → 컨테이너
 - **runc**: containerd의 요청을 받아 Linux namespace와 cgroup 등을
   사용해 실제 컨테이너 프로세스를 생성하는 저수준 런타임이다.
 
-즉 CRI는 프로그램이라기보다 인터페이스이고, containerd와 runc는 실제
-실행 과정에서 서로 다른 계층을 담당한다.
+CRI는 설치해서 실행하는 프로그램이 아니라 kubelet과 런타임 사이의 공통
+규칙에 가깝다. containerd는 이미지와 컨테이너를 관리하고, 그 아래의
+runc가 실제 Linux 프로세스를 만든다.
 
-따라서 Kubernetes 노드에 Docker Engine이 반드시 필요한 것은 아니다.
-이번 클러스터에서는 containerd를 런타임으로 사용했다.
+결국 Kubernetes Node에 Docker Engine이 꼭 필요한 것은 아니었다. 이번
+클러스터에서는 containerd를 바로 런타임으로 사용했다.
 
 이 때문에 Docker로 받은 이미지와 Kubernetes가 받은 이미지가 서로 다르게
 보일 수도 있다.
@@ -180,8 +198,8 @@ sudo ctr -n k8s.io images list
 
 ### master에서 이미지를 받으면 worker에도 생길까?
 
-처음에는 master가 이미지를 받으면 클러스터 전체가 함께 사용하는 줄 알았다.
-하지만 컨테이너 이미지는 기본적으로 노드마다 따로 관리된다.
+이것도 처음에는 master가 이미지를 받으면 클러스터 전체에서 같이 쓰는 줄
+알았다. 하지만 컨테이너 이미지는 Node마다 따로 저장된다.
 
 Container Registry는 빌드한 이미지를 저장하고 여러 서버에 배포하기 위한
 원격 저장소다. Docker Hub나 GitHub Container Registry가 대표적이며,
@@ -208,17 +226,18 @@ containerd가 Registry에서 필요한 이미지를 받는다.
 | `Always` | Pod를 시작할 때 Registry의 이미지 정보를 확인한다 |
 | `Never` | Registry에서 받지 않고 노드의 로컬 이미지만 사용한다 |
 
-따라서 여러 Worker에서 동일한 애플리케이션을 실행하려면 이미지를 직접
-복사하기보다 Docker Hub 같은 Registry를 사용하는 편이 관리하기 쉽다.
+그래서 여러 Worker에서 같은 애플리케이션을 실행하려면 이미지를 서버마다
+직접 복사하는 것보다 Docker Hub 같은 Registry에 올려두는 편이 편하다.
 
 ---
 
-## 4. 세 노드에 공통으로 적용한 사전 설정
+## 4. 세 VM에 공통 설정을 넣었다
 
-설정은 master와 worker 세 노드에 모두 적용했다.
-처음에는 설치 문서에 나온 명령을 그대로 실행했지만, 다시 보니 swap,
-커널 모듈, IP forwarding은 각각 메모리 관리와 컨테이너 파일시스템,
-Pod 네트워크를 준비하는 과정이었다.
+이제 master와 worker 세 대에 같은 설정을 적용했다.
+
+처음에는 설치 문서에 나온 명령을 거의 그대로 입력했다. 그런데 명령만
+남겨두면 나중에 다시 봐도 모를 것 같아서 swap, 커널 모듈, IP forwarding이
+왜 필요한지도 같이 찾아봤다.
 
 ### swap 비활성화
 
@@ -249,8 +268,9 @@ Linux 노드의 kubelet은 기본적으로 swap이 활성화되어 있으면 시
 이번 학습 환경에서는 해당 기능을 구성하지 않고 기본 동작에 맞춰 swap을
 비활성화했다.
 
-즉, “Kubernetes는 언제나 swap을 사용할 수 없다”라기보다 이번 구성에서는
-추가 변수를 줄이기 위해 사용하지 않았다고 이해하는 것이 정확하다.
+Kubernetes가 무조건 swap을 절대 사용할 수 없는 것은 아니었다. 별도
+설정으로 제한적으로 사용할 수도 있지만, 이번에는 처음 구성하는 환경이라
+변수를 줄이기 위해 그냥 껐다.
 
 ### 커널 모듈
 
@@ -298,7 +318,7 @@ lsmod | grep br_netfilter
 
 ### 네트워크 설정
 
-처음에는 `sysctl -w`로 현재 부팅에 설정을 적용했다.
+먼저 `sysctl -w`로 현재 부팅에 설정을 적용했다.
 
 IP forwarding은 Linux가 한 네트워크 인터페이스로 들어온 패킷을 다른
 인터페이스로 전달하게 하는 기능이다. Kubernetes Node에서는 Pod 네트워크와
@@ -338,9 +358,10 @@ Kubernetes Node
 
 ---
 
-## 5. containerd와 Kubernetes 패키지 설치
+## 5. containerd와 Kubernetes를 설치했다
 
-containerd를 설치한 뒤 기본 설정 파일을 생성했다.
+공통 설정을 마친 뒤 containerd를 설치했다. 설치만 하면 끝인 줄 알았는데
+Kubernetes와 같이 쓰려면 설정 파일도 확인해야 했다.
 
 ```bash
 sudo apt update
@@ -357,16 +378,16 @@ containerd config default |
 SystemdCgroup = true
 ```
 
-containerd와 kubelet이 같은 systemd cgroup 체계를 사용하게 하기 위한
-설정이다.
+여기서 또 처음 보는 것이 cgroup이었다.
 
-cgroup은 프로세스가 사용할 CPU와 메모리 같은 자원을 관리하는 Linux
-기능이다. Kubernetes에서 Pod에 resource request나 limit을 지정하면
-실제 제한은 이 계층에서 적용된다.
+**cgroup**은 프로세스가 사용할 CPU와 메모리 같은 자원을 관리하는 Linux
+기능이다. 나중에 Pod에 CPU나 메모리 제한을 지정하면 실제 제한은 이
+계층에서 적용된다.
 
-kubelet과 containerd가 서로 다른 cgroup driver를 사용하면 동일한
-프로세스와 자원을 서로 다르게 해석할 수 있다. Ubuntu가 systemd를
-사용하므로 두 구성요소도 systemd 방식으로 맞췄다.
+`SystemdCgroup = true`는 containerd와 kubelet이 같은 systemd 방식으로
+cgroup을 관리하게 맞추는 설정이다. 둘이 서로 다른 방식을 사용하면 같은
+프로세스와 자원을 다르게 해석할 수 있다고 해서 Ubuntu의 systemd 방식으로
+통일했다.
 
 containerd를 Kubernetes에서 사용하려면 CRI 기능도 활성화되어 있어야 한다.
 `config.toml`의 `disabled_plugins`에 `cri`가 들어 있지 않은지 확인했다.
@@ -430,12 +451,13 @@ kubectl version --client
 
 ---
 
-## 6. Control Plane 초기화
+## 6. master에서 kubeadm init을 실행했다
 
-`k8s-master`에서 다음과 같은 형태로 클러스터를 초기화했다.
-처음에는 단순히 master를 등록하는 명령으로 생각했지만, 실제로는 인증서,
-etcd, API Server, Scheduler 같은 Control Plane 구성요소를 함께 만드는
-작업이었다.
+이제 `k8s-master`에서 클러스터를 만들었다.
+
+처음에는 `kubeadm init`이 master를 등록하는 정도의 명령인 줄 알았다.
+실제로는 인증서, etcd, API Server, Scheduler 같은 Control Plane 구성요소를
+한꺼번에 만드는 작업이었다.
 
 ```bash
 sudo kubeadm init \
@@ -466,8 +488,8 @@ sudo kubeadm init \
 서버다. **kube-proxy**는 각 Node에서 Service 트래픽이 실제 Pod로 전달되도록
 네트워크 규칙을 관리한다.
 
-따라서 둘 다 애플리케이션 Pod가 다른 Pod나 Service와 통신하는 데 필요한
-기본 구성요소다.
+CoreDNS와 kube-proxy 모두 애플리케이션 Pod가 다른 Pod나 Service와
+통신할 때 필요한 기본 구성요소였다.
 
 Control Plane 구성요소는 다음 경로에 static Pod manifest로 생성된다.
 
@@ -484,8 +506,9 @@ kube-controller-manager
 kube-scheduler
 ```
 
-초기화 직후에는 CNI가 없기 때문에 CoreDNS가 바로 정상화되지 않을 수 있다.
-따라서 `kubeadm init` 성공과 Pod 네트워크 완성은 별개의 단계다.
+그런데 `kubeadm init`이 성공했다고 클러스터가 전부 끝난 것은 아니었다.
+이 시점에는 아직 CNI가 없어서 CoreDNS가 바로 정상화되지 않을 수 있다.
+Pod 네트워크는 다음 단계에서 따로 만들어야 했다.
 
 초기화가 끝난 뒤 일반 사용자도 `kubectl`을 사용할 수 있도록 kubeconfig를
 복사했다.
@@ -515,11 +538,14 @@ context
 
 ---
 
-## 7. 두 Worker를 클러스터에 연결
+## 7. worker1과 worker2를 join했다
 
-`kubeadm init` 결과로 출력된 join 명령을 두 Worker에서 실행했다.
-명령에 포함된 token과 CA hash가 무엇인지 몰랐는데, Worker가 처음 자신을
-등록하고 올바른 API Server에 접속했는지 확인하기 위한 값이었다.
+`kubeadm init`이 끝나면 Worker에서 실행할 join 명령이 출력된다. 그 명령을
+`k8s-worker1`과 `k8s-worker2`에서 각각 실행했다.
+
+명령 안에 token과 CA hash가 들어 있었는데 처음에는 왜 필요한지 몰랐다.
+찾아보니 Worker가 처음 자신을 등록하고, 접속한 API Server가 진짜 내가 만든
+서버인지 확인하는 데 사용하는 값이었다.
 
 ```bash
 sudo kubeadm join 192.168.0.12:6443 \
@@ -568,15 +594,14 @@ sudo journalctl -u kubelet -n 100 --no-pager
 
 ---
 
-## 8. CNI로 Calico 설치
+## 8. NotReady를 해결하려고 Calico를 설치했다
 
-Worker가 클러스터에 참가해도 CNI가 없으면 노드는 `NotReady` 상태일 수
-있다. Kubernetes는 Pod 배치를 관리하지만, Pod IP 할당과 노드 간 통신은
-CNI 플러그인이 담당하기 때문이다.
+join 명령은 성공했는데 `kubectl get nodes`를 실행하니 Worker가
+`NotReady`로 나왔다. join이 성공했으니 바로 끝난 줄 알았는데 아니었다.
 
-실제로 join까지 끝났는데 노드가 바로 `Ready`가 되지 않아 이유를 찾아봤고,
-아직 Pod 네트워크가 없다는 점을 알게 됐다. 이번 환경에서는 CNI로 Calico를
-사용했다.
+이유는 아직 CNI가 없어서였다. Kubernetes가 Pod 배치는 관리하지만, Pod
+IP를 나눠주고 서로 통신하게 만드는 일은 CNI 플러그인이 맡는다. 이번에는
+Calico를 설치했다.
 
 **CNI(Container Network Interface)**는 컨테이너 네트워크를 구성하기 위한
 표준이다. Kubernetes는 이 규칙을 구현한 플러그인에 Pod의 네트워크 설정을
@@ -585,9 +610,12 @@ CNI 플러그인이 담당하기 때문이다.
 **Calico**는 CNI를 구현해 Pod IP 할당과 Node 간 라우팅, Pod 사이의
 통신 허용·차단 규칙인 NetworkPolicy를 제공하는 네트워크 플러그인이다.
 
-**Tigera Operator**는 Calico 구성요소를 설치하고 원하는 상태로 유지하는
-Kubernetes Operator다. 즉 Tigera와 Calico가 서로 경쟁하는 별도 네트워크
-제품인 것이 아니라, 이번 구성에서는 Operator가 Calico를 관리한다.
+설치하고 보니 `tigera-operator`라는 Namespace와 Pod도 생겼다. Calico를
+깔았는데 Tigera는 또 뭔가 싶었다.
+
+**Tigera Operator**는 Calico 구성요소를 설치하고 상태를 유지하는
+Kubernetes Operator다. Tigera와 Calico가 따로 경쟁하는 프로그램이 아니라,
+이번 구성에서는 Tigera Operator가 Calico를 관리하고 있었다.
 
 ```text
 Tigera Operator
@@ -596,9 +624,6 @@ Tigera Operator
    ├─ calico-kube-controllers
    └─ calico-apiserver
 ```
-
-처음에는 `tigera-operator`가 Calico와 다른 프로그램인 줄 알았다.
-실제로는 Calico 구성요소를 설치하고 관리하는 Operator였다.
 
 설치할 때는 `kubeadm init`에서 지정한 Pod CIDR과 Calico의 IP pool CIDR이
 일치하는지 확인해야 한다. 또한 이 주소가 실제 LAN 대역과 겹치면 안 된다.
@@ -655,18 +680,18 @@ kubectl describe node <NODE_NAME>
 3. Pod IP가 의도한 CIDR에서 할당됐는가?
 4. Node의 `Conditions`와 Events에 네트워크 오류가 있는가?
 
-`NotReady`는 원인 그 자체가 아니라 현재 상태를 나타낸다. 따라서 상태
-문자열만 보고 재설치하기보다 Events와 관련 시스템 Pod를 함께 봐야 한다.
+`NotReady` 자체가 오류의 원인인 것은 아니었다. 그냥 현재 준비되지 않았다는
+상태만 보여준다. 원인을 찾으려면 Events와 관련 시스템 Pod를 같이 봐야 했다.
 
 ---
 
-## 9. 세 노드가 Ready인지 검증
+## 9. 세 노드가 Ready가 됐다
 
 ```bash
 kubectl get nodes
 ```
 
-세 노드가 모두 `Ready` 상태가 됐다.
+Calico 설치가 끝난 뒤 세 Node가 모두 `Ready` 상태가 됐다.
 
 ```text
 NAME          STATUS   ROLES           VERSION
@@ -701,7 +726,9 @@ kubectl get pods -n calico-system
 kubectl get pods -n tigera-operator
 ```
 
-출력이 복잡해 보이지만 namespace별로 나누면 이해하기 쉽다.
+`kubectl get pods -A` 결과는 처음 보면 꽤 복잡하다. Namespace별로
+나눠 보니 그나마 무엇이 Kubernetes 자체 구성요소이고 무엇이 Calico인지
+구분할 수 있었다.
 
 - `kube-system`: Kubernetes 핵심 구성요소
 - `calico-system`: Calico 네트워크 구성요소
@@ -724,13 +751,12 @@ CrashLoopBackOff
 └─ 컨테이너가 반복 종료되어 재시작 간격이 늘어난 상태
 ```
 
-`Running` 하나만 보고 전체 기능이 정상이라고 단정할 수는 없다.
-노드, 시스템 Pod, CNI 상태를 함께 확인해야 클러스터 기본 구성이 정상이라고
-판단할 수 있다.
+여기서 `Running`만 보인다고 전부 정상인 것도 아니었다. Node 상태, 시스템
+Pod, CNI 상태까지 같이 봐야 기본 구성이 끝났다고 볼 수 있었다.
 
 ---
 
-## 10. 명령이 Pod 실행으로 이어지는 전체 흐름
+## 10. 이제 전체 흐름이 조금 보였다
 
 ```text
 kubectl
@@ -749,9 +775,9 @@ Calico
 └─ Pod IP 할당과 노드 간 통신 담당
 ```
 
-Kubernetes를 하나의 거대한 프로그램으로 생각하면 복잡하다.
-각 구성요소가 어떤 요청을 받아 누구에게 전달하는지 순서대로 보면 조금씩
-구조가 보이기 시작한다.
+처음에는 Kubernetes가 그냥 컨테이너를 여러 서버에 띄워주는 하나의 큰
+프로그램처럼 보였다. 여기까지 직접 구성하고 나니 여러 구성요소가 요청을
+주고받는 구조라는 게 조금 보이기 시작했다.
 
 예를 들어 이후 YAML로 Deployment를 적용하면 다음 순서로 진행된다.
 
@@ -766,7 +792,7 @@ Kubernetes를 하나의 거대한 프로그램으로 생각하면 복잡하다.
 8. Calico가 Pod IP와 네트워크 구성
 ```
 
-이 흐름을 이해하고 나니 질문의 범위도 나눌 수 있었다.
+오류가 났을 때 어디부터 봐야 하는지도 이전보다는 조금 구분할 수 있게 됐다.
 
 ```text
 Pod가 어느 Node에 배치됐는가?
@@ -789,34 +815,36 @@ Node 자체가 불안정한가?
 
 ## 11. AI의 도움을 받은 방식
 
-이번 작업에서는 AI에게 설치 순서, 명령어의 의미, 오류 메시지의 원인을
-질문했다. 답변을 그대로 실행하기보다는 현재 서버 상태를 다시 확인하고,
-명령 실행 결과가 예상과 같은지 비교했다.
+이번 작업은 모르는 것이 나올 때마다 AI에 물어보면서 진행했다.
+Docker 없이 Kubernetes를 구성해도 되는지, containerd는 어디에 이미지를
+저장하는지, join이 성공했는데 왜 `NotReady`인지 같은 것들을 계속 물었다.
 
-궁금한 내용을 마지막에 질문 목록으로 몰아넣으면 실제 진행 과정이 끊겨
-보였다. 그래서 Docker와 containerd의 차이는 런타임을 설치한 부분에,
-`NotReady`의 이유는 Calico를 설치한 부분에 적는 식으로 작업 과정 안에
-질문과 이해한 내용을 함께 남겼다.
+물론 답변을 그대로 복사해서 실행한 것은 아니다. 서버의 현재 상태를 먼저
+확인하고, 명령을 실행한 뒤 출력이 예상과 같은지 다시 확인했다. 틀리거나
+내 환경과 맞지 않는 답도 있어서 공식 문서도 같이 봤다.
 
-AI를 사용하지 않았다고 숨기기보다, **어디까지 도움을 받았고 무엇을 직접
-검증했는지 남기는 것**도 이번 공부의 일부라고 생각한다.
+AI를 썼다는 사실을 굳이 숨길 필요는 없다고 생각한다. 대신 무엇을 물었고,
+내 서버에서 무엇을 직접 확인했는지는 남겨두려고 한다. 그래야 나중에 다시
+봤을 때 내 공부 기록이 된다.
 
 ---
 
 ## 12. 마치며
 
-이번 구성에서 가장 크게 바뀐 생각은 Kubernetes를 하나의 프로그램으로
-보지 않게 된 것이다. 클러스터 구성은 kubeadm, 노드의 지속적인 관리는
-kubelet, 컨테이너 실행은 containerd, Pod 네트워크는 Calico가 담당했다.
+사실 시작할 때는 Docker를 설치하고 `kubeadm` 명령 몇 개만 입력하면 끝날
+줄 알았다. 막상 해보니 Kubernetes 하나를 설치한 것이 아니라 kubelet,
+containerd, Calico 같은 여러 구성요소를 연결한 것이었다.
 
-명령이 성공했다는 사실만으로 전체 시스템이 정상인 것도 아니었다.
-노드 등록, CNI 상태, 시스템 Pod, 실제 네트워크가 각각 정상인지 단계별로
-확인해야 했다.
+명령 하나가 성공했다고 전체가 정상인 것도 아니었다. Worker가 등록됐는지,
+CNI가 올라왔는지, 시스템 Pod가 제대로 실행되는지 따로 확인해야 했다.
 
-현재는 세 노드가 `Ready`인 기본 클러스터까지만 완성했다. 다음 글에서는
-Sock Shop을 배포하면서 Namespace, Deployment, ReplicaSet, Pod, Service가
-어떻게 연결되는지, 그리고 장애 상태를 어떤 순서로 확인하는지 정리할
-예정이다.
+아직 Kubernetes를 능숙하게 다루는 단계는 아니다. 그래도 VM 3대를 직접
+묶고 세 Node가 `Ready`가 되는 것까지 확인하면서, 적어도 각 프로그램이
+왜 필요한지는 전보다 조금 알게 됐다.
+
+다음 글에서는 이 클러스터에 Sock Shop을 올려볼 예정이다. 그 과정에서
+Namespace, Deployment, ReplicaSet, Pod, Service가 어떻게 연결되는지와
+실제로 발생한 오류를 정리해 보려고 한다.
 
 ---
 
