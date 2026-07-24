@@ -413,12 +413,34 @@ Deployment, Pod, Service와 장애 확인 방법을 정리할 예정이다.
 질문했다. 답변을 그대로 실행하기보다는 현재 서버 상태를 다시 확인하고,
 명령 실행 결과가 예상과 같은지 비교했다.
 
-기록을 다시 보니 특히 중요했던 질문은 다음과 같았다.
+기록을 다시 확인해 보니 실제로 다음과 같은 질문을 하면서 진행했다.
 
+### 컨테이너 실행과 이미지
+
+- containerd는 정확히 무엇을 담당하는가?
 - Kubernetes를 사용하려면 Docker를 반드시 설치해야 하는가?
+- CRI는 무엇이고 kubelet과 containerd 사이에서 어떤 역할을 하는가?
+- containerd와 runc는 어떻게 다른가?
+- Container Registry는 왜 필요한가?
 - master에서 이미지를 받으면 worker에도 자동으로 전달되는가?
 - Docker와 containerd의 이미지 목록이 왜 서로 다른가?
+
+### Linux 자원과 네트워크 설정
+
+- cgroup은 무엇이며 Pod의 CPU와 메모리 제한과 어떤 관계가 있는가?
+- `SystemdCgroup = true`는 왜 설정하는가?
+- `/etc/containerd`와 `config.toml`을 왜 직접 만드는가?
+- `overlay` 커널 모듈은 어디에 사용되는가?
+- `br_netfilter`는 왜 필요한가?
+- IP forwarding은 왜 활성화해야 하는가?
+- Proxmox와 Kubernetes 노드의 IP forwarding은 목적이 어떻게 다른가?
+
+### Kubernetes 클러스터
+
+- kubeadm, kubelet, kubectl은 각각 무엇을 하는가?
+- CNI가 없으면 노드가 왜 `NotReady`가 되는가?
 - Tigera Operator와 Calico는 어떤 관계인가?
+- `kubectl get tigerastatus`는 무엇을 확인하는 명령인가?
 - `sudo kubectl`은 왜 `localhost:8080`으로 접속하려 했는가?
 
 특히 `sudo kubectl`의 kubeconfig 문제나 Docker와 containerd의 이미지
