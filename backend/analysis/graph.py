@@ -444,50 +444,72 @@ class DependencyGraph:
 
     # ─── 누락 리소스 감지 ─────────────────────
 
+    @staticmethod
+    def _should_promote_missing_dependency(pod: MiniPod) -> bool:
+        """Return true only when a missing dependency is an active startup failure.
+
+        A ConfigMap or Secret can disappear after a Pod has already mounted it.
+        The Pod may remain healthy, especially when an operator rotates generated
+        configuration. Treating every historical reference as ERROR makes a
+        healthy baseline look faulty. Terminal Pods are historical evidence, and
+        a live dependency is promoted only when kubelet explicitly reports the
+        configuration-startup failure.
+        """
+        return (
+            pod.phase not in {"Succeeded", "Failed"}
+            and pod.status == "ERROR"
+            and pod.error_reason == "CreateContainerConfigError"
+        )
+
+    def _add_missing_dependency(
+        self,
+        pod: MiniPod,
+        kind: str,
+        dependency_name: str,
+    ) -> None:
+        pod_id = self._node_id("Pod", pod.namespace, pod.name)
+        dep_id = self._node_id(kind, pod.namespace, dependency_name)
+        missing_node = GraphNode(
+            id=dep_id,
+            kind=kind,
+            name=dependency_name,
+            namespace=pod.namespace,
+            status="ERROR",
+            error_reason="Missing",
+            error_message=(
+                f"{kind}/{dependency_name} 리소스가 클러스터에 존재하지 않음"
+            ),
+            priority=PRIORITY_MISSING,
+            is_system=False,
+        )
+        self._add_node(missing_node)
+        self._add_edge(pod_id, dep_id)
+        logger.warning(f"[WARN] 시작 실패 원인의 누락 리소스 감지: {dep_id}")
+
     def _detect_missing_resources(self, cache) -> None:
-        """파드의 cm_names, secret_names, pvc_names를 cache Set과 직접 대조"""
+        """Promote only active Pod startup failures caused by a missing dependency.
+
+        All dependency edges are retained by _link_pod_edges(). A missing
+        ConfigMap, Secret, or PVC becomes an ERROR node only when the current
+        Pod is explicitly failing with CreateContainerConfigError.
+        """
+        pvc_exists = {(p.namespace, p.name) for p in cache.pvcs}
+
         for pod in cache.pods:
-            pod_id = self._node_id("Pod", pod.namespace, pod.name)
+            if not self._should_promote_missing_dependency(pod):
+                continue
 
             for cm_name in pod.cm_names:
                 if (pod.namespace, cm_name) not in cache.cm_exists:
-                    dep_id = self._node_id("ConfigMap", pod.namespace, cm_name)
-                    missing_node = GraphNode(
-                        id=dep_id, kind="ConfigMap", name=cm_name, namespace=pod.namespace,
-                        status="ERROR", error_reason="Missing",
-                        error_message=f"ConfigMap/{cm_name} 리소스가 클러스터에 존재하지 않음",
-                        priority=PRIORITY_MISSING, is_system=False
-                    )
-                    self._add_node(missing_node)
-                    self._add_edge(pod_id, dep_id)
-                    logger.warning(f"[WARN] 누락 리소스 감지: {dep_id}")
+                    self._add_missing_dependency(pod, "ConfigMap", cm_name)
 
             for secret_name in pod.secret_names:
                 if (pod.namespace, secret_name) not in cache.secret_exists:
-                    dep_id = self._node_id("Secret", pod.namespace, secret_name)
-                    missing_node = GraphNode(
-                        id=dep_id, kind="Secret", name=secret_name, namespace=pod.namespace,
-                        status="ERROR", error_reason="Missing",
-                        error_message=f"Secret/{secret_name} 리소스가 클러스터에 존재하지 않음",
-                        priority=PRIORITY_MISSING, is_system=False
-                    )
-                    self._add_node(missing_node)
-                    self._add_edge(pod_id, dep_id)
-                    logger.warning(f"[WARN] 누락 리소스 감지: {dep_id}")
+                    self._add_missing_dependency(pod, "Secret", secret_name)
 
             for pvc_name in pod.pvc_names:
-                pvc_exists = any(p.name == pvc_name and p.namespace == pod.namespace for p in cache.pvcs)
-                if not pvc_exists:
-                    dep_id = self._node_id("PVC", pod.namespace, pvc_name)
-                    missing_node = GraphNode(
-                        id=dep_id, kind="PVC", name=pvc_name, namespace=pod.namespace,
-                        status="ERROR", error_reason="Missing",
-                        error_message=f"PVC/{pvc_name} 리소스가 클러스터에 존재하지 않음",
-                        priority=PRIORITY_MISSING, is_system=False
-                    )
-                    self._add_node(missing_node)
-                    self._add_edge(pod_id, dep_id)
-                    logger.warning(f"[WARN] 누락 리소스 감지: {dep_id}")
+                if (pod.namespace, pvc_name) not in pvc_exists:
+                    self._add_missing_dependency(pod, "PVC", pvc_name)
 
     # ─── 근본 원인 분석 ───────────────────────
 
