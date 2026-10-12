@@ -4,6 +4,7 @@ main.py
 KubeIn 전체 분석 파이프라인 오케스트레이션 및 FastAPI 서비스 제공
 """
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -16,6 +17,10 @@ from fastapi.responses import JSONResponse
 from infra.config import load_k8s_config
 from infra.cache import ResourceCache
 from infra.metrics import MetricsAnalyzer
+from infra.network_evidence import (
+    NetworkEvidenceCollectionError,
+    collect_network_evidence,
+)
 from analysis.analyzers import (
     PodAnalyzer, DeploymentAnalyzer, NodeAnalyzer,
     ServiceAnalyzer, IngressAnalyzer, PVCAnalyzer,
@@ -23,7 +28,12 @@ from analysis.analyzers import (
 )
 from analysis.graph import DependencyGraph
 from analysis.events import EventAnalyzer
-from intelligence.llm import LLMClient, Retriever
+from intelligence.llm import (
+    LLMClient,
+    Retriever,
+    build_rag_query,
+    redact_provider_error,
+)
 
 
 # ── 앱 초기화 ────────────────────────────────────────────────────────
@@ -66,8 +76,11 @@ CACHE_TTL = 30
 _eval_snapshot_lock = Lock()
 _eval_snapshots: dict[str, dict] = {}
 _expired_eval_snapshot_ids: dict[str, float] = {}
-EVAL_SNAPSHOT_TTL = 15 * 60
+_cancelled_eval_snapshot_ids: dict[str, float] = {}
+EVAL_SNAPSHOT_TTL = 40 * 60
 MAX_EVAL_SNAPSHOTS = 8
+MAX_EVAL_SNAPSHOT_TOMBSTONES = 32
+EVAL_SNAPSHOT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _prune_eval_snapshots_locked(now_monotonic: float) -> None:
@@ -75,6 +88,11 @@ def _prune_eval_snapshots_locked(now_monotonic: float) -> None:
     for snapshot_id, tombstone_expires_at in list(_expired_eval_snapshot_ids.items()):
         if now_monotonic >= tombstone_expires_at:
             _expired_eval_snapshot_ids.pop(snapshot_id, None)
+    for snapshot_id, tombstone_expires_at in list(
+        _cancelled_eval_snapshot_ids.items()
+    ):
+        if now_monotonic >= tombstone_expires_at:
+            _cancelled_eval_snapshot_ids.pop(snapshot_id, None)
 
     expired_ids = [
         snapshot_id
@@ -90,6 +108,22 @@ def _prune_eval_snapshots_locked(now_monotonic: float) -> None:
         _expired_eval_snapshot_ids[snapshot_id] = now_monotonic + EVAL_SNAPSHOT_TTL
         if record.get("active_requests", 0) == 0:
             _eval_snapshots.pop(snapshot_id, None)
+
+
+def _record_eval_snapshot_cancellation_locked(
+    snapshot_id: str,
+    now_monotonic: float,
+) -> None:
+    """선행 DELETE도 지연 POST를 취소하되 tombstone 수는 제한합니다."""
+    _cancelled_eval_snapshot_ids[snapshot_id] = (
+        now_monotonic + EVAL_SNAPSHOT_TTL
+    )
+    while len(_cancelled_eval_snapshot_ids) > MAX_EVAL_SNAPSHOT_TOMBSTONES:
+        earliest_id = min(
+            _cancelled_eval_snapshot_ids,
+            key=_cancelled_eval_snapshot_ids.get,
+        )
+        _cancelled_eval_snapshot_ids.pop(earliest_id, None)
 
 
 def _acquire_eval_snapshot(snapshot_id: str):
@@ -129,16 +163,39 @@ def _release_eval_snapshot_use(snapshot_id: str) -> None:
 def _get_or_build_graph():
     """TTL 기반 ResourceCache + DependencyGraph 캐싱."""
     now = time.time()
+    cache = None
     with _cache_lock:
         if _cache_store["cache"] and now < _cache_store["expires_at"]:
-            return _cache_store["cache"], _cache_store["graph"], _cache_store["results"]
+            if _network_graph_cache_reuse_allowed():
+                return (
+                    _cache_store["cache"],
+                    _cache_store["graph"],
+                    _cache_store["results"],
+                )
+            cache = _cache_store["cache"]
 
     t0 = time.time()
-    cache = ResourceCache()
+    cache_was_collected = cache is None
+    if cache_was_collected:
+        cache = ResourceCache()
     t1 = time.time()
-    print(f"[INFO] ResourceCache (K8s API 17회 호출): {t1 - t0:.1f}초")
+    if cache_was_collected:
+        print(f"[INFO] ResourceCache (K8s API 17회 호출): {t1 - t0:.1f}초")
+    else:
+        print("[INFO] ResourceCache 재사용; network evidence는 새로 수집")
+
+    reuse_graph = _network_graph_cache_reuse_allowed()
+    if cache_was_collected and not reuse_graph:
+        with _cache_lock:
+            _cache_store.update({
+                "cache": cache,
+                "graph": None,
+                "results": None,
+                "expires_at": time.time() + CACHE_TTL,
+            })
 
     graph = DependencyGraph(cache)
+    _augment_graph_with_network_evidence(graph)
     t2 = time.time()
     print(f"[INFO] DependencyGraph 구축: {t2 - t1:.1f}초")
 
@@ -146,13 +203,103 @@ def _get_or_build_graph():
     t3 = time.time()
     print(f"[INFO] RCA 탐색: {t3 - t2:.1f}초")
 
-    with _cache_lock:
-        _cache_store.update({
-            "cache": cache, "graph": graph,
-            "results": results, "expires_at": time.time() + CACHE_TTL,
-        })
+    if reuse_graph:
+        with _cache_lock:
+            _cache_store.update({
+                "cache": cache,
+                "graph": graph,
+                "results": results,
+                "expires_at": time.time() + CACHE_TTL,
+            })
 
     return cache, graph, results
+
+
+def _network_evidence_enabled() -> bool:
+    return os.environ.get("KUBEIN_NETWORK_EVIDENCE_ENABLED", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _network_evidence_required() -> bool:
+    return os.environ.get("KUBEIN_NETWORK_EVIDENCE_REQUIRED", "true").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _network_graph_cache_reuse_allowed() -> bool:
+    """필수 probe 모드에서는 매 요청마다 freshness와 scrape 상태를 재검증합니다."""
+    return not (
+        _network_evidence_enabled()
+        and _network_evidence_required()
+    )
+
+
+def _expected_network_probe_workloads() -> set[str]:
+    raw = os.environ.get(
+        "KUBEIN_NETWORK_PROBE_EXPECTED_WORKLOADS",
+        "shipping,payment,front-end",
+    )
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _current_network_probe_sources(graph) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for node in graph.nodes.values():
+        if node.kind != "Pod" or node.namespace != "sock-shop":
+            continue
+        labels = getattr(node.raw, "labels", {}) or {}
+        if labels.get("kubein.io/network-probe") != "true":
+            continue
+        workload = labels.get("name", "")
+        if not workload:
+            raise NetworkEvidenceCollectionError(
+                f"network probe Pod has no workload label: {node.name}"
+            )
+        sources[node.name] = workload
+
+    expected_workloads = _expected_network_probe_workloads()
+    observed_workloads = set(sources.values())
+    if expected_workloads and observed_workloads != expected_workloads:
+        missing = sorted(expected_workloads - observed_workloads)
+        unexpected = sorted(observed_workloads - expected_workloads)
+        raise NetworkEvidenceCollectionError(
+            "network probe workload inventory mismatch "
+            f"(missing={','.join(missing) or '-'},"
+            f" unexpected={','.join(unexpected) or '-'})"
+        )
+    return sources
+
+
+def _augment_graph_with_network_evidence(
+    graph,
+    *,
+    reference_time: float | None = None,
+    strict: bool = False,
+) -> int:
+    """Add one time-consistent probe batch when the extension is enabled."""
+    if not _network_evidence_enabled():
+        return 0
+    fail_closed = strict or _network_evidence_required()
+    try:
+        expected_sources = _current_network_probe_sources(graph)
+        evidence = collect_network_evidence(
+            namespace="sock-shop",
+            reference_time=reference_time,
+            expected_sources=expected_sources,
+        )
+        added = graph.add_network_evidence(evidence)
+        print(f"[INFO] Network probe evidence added: {added}")
+        return added
+    except Exception as exc:
+        if fail_closed:
+            if isinstance(exc, NetworkEvidenceCollectionError):
+                raise
+            raise NetworkEvidenceCollectionError(
+                "network probe evidence collection failed"
+            ) from exc
+        print(f"[WARN] Network probe evidence unavailable: {exc}")
+        return 0
 
 
 # ── 공통 헬퍼 ────────────────────────────────────────────────────────
@@ -181,14 +328,18 @@ def _build_rca_context(root_causes) -> str:
     return rca_text
 
 
-def _build_rag_query(root_causes) -> str:
-    """에러 키워드 기반 RAG 쿼리 생성 (전체 컨텍스트 대신 핵심 키워드만 사용)."""
-    if not root_causes:
-        return "Kubernetes cluster healthy no errors"
-    parts = []
-    for rc in root_causes[:3]:
-        parts.append(f"Kubernetes {rc.root_cause_kind} {rc.root_cause_status} {rc.root_cause_reason}")
-    return " ".join(parts)
+def _build_rag_query(root_causes, error_summary: str = "") -> str:
+    """하위 호환용 wrapper. 실제 검색어 정규화는 intelligence.llm이 담당한다."""
+    return build_rag_query(root_causes, error_summary)
+
+
+def _llm_error_status(exc: Exception) -> str:
+    message = str(exc)
+    if "quota_exhausted" in message:
+        return "quota_exhausted"
+    if "LLM 응답 무결성 실패" in message:
+        return "invalid_response"
+    return "error"
 
 
 def _build_graph_payload(graph, results):
@@ -343,7 +494,7 @@ def analyze_cluster():
         full_context = timestamp_header + error_summary_text + rca_summary + metrics_context
 
         # 에러 키워드 기반 RAG 쿼리
-        rag_query = _build_rag_query(root_causes)
+        rag_query = _build_rag_query(root_causes, error_summary_text)
         rag_texts = retriever.search_texts_only(rag_query)
         ai_analysis = llm.analyze(full_context, rag_texts)
 
@@ -353,6 +504,11 @@ def analyze_cluster():
 
         return {"status": "success", "data": parsed_data}
 
+    except NetworkEvidenceCollectionError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)},
+        )
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -381,6 +537,11 @@ def causality_fast():
         payload["ai_analysis"] = ""
         return {"status": "success", "data": payload}
 
+    except NetworkEvidenceCollectionError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)},
+        )
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
@@ -414,7 +575,12 @@ def health_check():
 
     results["llm"] = {
         "status": "configured",
-        "base_url": os.environ.get("LLM_BASE_URL", "http://222.105.251.70:30135/v1"),
+        "base_url": redact_provider_error(
+            os.environ.get(
+                "LLM_BASE_URL",
+                "http://222.105.251.70:30135/v1",
+            )
+        ),
         "model": os.environ.get("LLM_MODEL", "qwen3-32b-gpu3-test"),
     }
 
@@ -426,16 +592,59 @@ def health_check():
     return results
 
 
+@app.get("/api/health/llm")
+def llm_connection_health_check():
+    """Run an on-demand, bounded LLM connectivity and authentication probe."""
+    try:
+        details = llm.check_connection()
+        return {"status": "ready", **details}
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "message": redact_provider_error(str(e)),
+            },
+        )
+
+
 @app.post("/api/evaluate/snapshots")
-def create_evaluation_snapshot():
+def create_evaluation_snapshot(snapshot_id: str = ""):
     """3-mode 평가가 공유할 ResourceCache/DependencyGraph 관측본을 생성합니다."""
-    snapshot_id = uuid.uuid4().hex
+    if snapshot_id:
+        if EVAL_SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id) is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "snapshot_id는 소문자 32자리 hex여야 합니다.",
+                },
+            )
+    else:
+        snapshot_id = uuid.uuid4().hex
+
     captured_at = time.time()
     captured_at_iso = datetime.utcfromtimestamp(captured_at).isoformat() + "Z"
 
     with _eval_snapshot_lock:
         now_monotonic = time.monotonic()
         _prune_eval_snapshots_locked(now_monotonic)
+        if snapshot_id in _cancelled_eval_snapshot_ids:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "error",
+                    "message": "평가 snapshot 예약이 취소되었습니다.",
+                },
+            )
+        if snapshot_id in _eval_snapshots:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "error",
+                    "message": "동일한 snapshot_id가 이미 예약되어 있습니다.",
+                },
+            )
         if len(_eval_snapshots) >= MAX_EVAL_SNAPSHOTS:
             return JSONResponse(
                 status_code=503,
@@ -445,13 +654,14 @@ def create_evaluation_snapshot():
                 },
             )
         # 느린 K8s 수집 중에도 동시 생성 한도를 넘지 않도록 slot을 예약합니다.
-        _eval_snapshots[snapshot_id] = {
+        reservation = {
             "state": "building",
             "expires_at_monotonic": now_monotonic + EVAL_SNAPSHOT_TTL,
             "active_requests": 0,
             "delete_requested": False,
             "expired": False,
         }
+        _eval_snapshots[snapshot_id] = reservation
 
     try:
         cache = ResourceCache()
@@ -461,6 +671,11 @@ def create_evaluation_snapshot():
                 f"K8s 리소스 부분 수집 실패: {collection_failures}/17 API calls"
             )
         graph = DependencyGraph(cache)
+        _augment_graph_with_network_evidence(
+            graph,
+            reference_time=captured_at,
+            strict=True,
+        )
         error_node_count = len([
             node
             for node in graph.nodes.values()
@@ -470,9 +685,9 @@ def create_evaluation_snapshot():
         with _eval_snapshot_lock:
             now_monotonic = time.monotonic()
             _prune_eval_snapshots_locked(now_monotonic)
-            reservation = _eval_snapshots.get(snapshot_id)
+            current_reservation = _eval_snapshots.get(snapshot_id)
             if (
-                reservation is None
+                current_reservation is not reservation
                 or reservation.get("state") != "building"
                 or reservation.get("delete_requested")
             ):
@@ -501,9 +716,23 @@ def create_evaluation_snapshot():
         }
     except Exception as e:
         with _eval_snapshot_lock:
-            _eval_snapshots.pop(snapshot_id, None)
+            if _eval_snapshots.get(snapshot_id) is reservation:
+                _eval_snapshots.pop(snapshot_id, None)
+                reservation_cancelled = False
+            else:
+                reservation_cancelled = True
+        if reservation_cancelled:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "error",
+                    "message": "평가 snapshot 예약이 만료되거나 취소되었습니다.",
+                },
+            )
         return JSONResponse(
-            status_code=500,
+            status_code=(
+                503 if isinstance(e, NetworkEvidenceCollectionError) else 500
+            ),
             content={"status": "error", "message": str(e)},
         )
 
@@ -512,13 +741,26 @@ def create_evaluation_snapshot():
 def release_evaluation_snapshot(snapshot_id: str):
     """평가 관측본을 해제합니다. 이미 없더라도 성공하는 idempotent API입니다."""
     with _eval_snapshot_lock:
-        _prune_eval_snapshots_locked(time.monotonic())
+        now_monotonic = time.monotonic()
+        _prune_eval_snapshots_locked(now_monotonic)
         record = _eval_snapshots.get(snapshot_id)
         released = record is not None
         if record is not None:
             record["delete_requested"] = True
             if record.get("active_requests", 0) == 0:
                 _eval_snapshots.pop(snapshot_id, None)
+        # A tombstone is only needed when DELETE won the race before the POST
+        # reserved its client-generated ID. Existing building/ready records are
+        # already protected by reservation identity, so normal releases must
+        # not consume the bounded tombstone capacity.
+        if (
+            record is None
+            and EVAL_SNAPSHOT_ID_PATTERN.fullmatch(snapshot_id) is not None
+        ):
+            _record_eval_snapshot_cancellation_locked(
+                snapshot_id,
+                now_monotonic,
+            )
     return {"status": "ok", "released": released}
 
 
@@ -561,22 +803,7 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
             analysis_timestamp = snapshot["captured_at"]
             snapshot_captured_at = snapshot["captured_at_iso"]
         else:
-            now = time.time()
-            with _cache_lock:
-                if _cache_store["cache"] and now < _cache_store["expires_at"]:
-                    cache = _cache_store["cache"]
-                    graph = _cache_store["graph"]
-                else:
-                    cache = None
-
-            if cache is None:
-                cache = ResourceCache()
-                graph = DependencyGraph(cache)
-                with _cache_lock:
-                    _cache_store.update({
-                        "cache": cache, "graph": graph,
-                        "results": None, "expires_at": time.time() + CACHE_TTL,
-                    })
+            cache, graph, _ = _get_or_build_graph()
 
         timestamp_str = datetime.utcfromtimestamp(analysis_timestamp).isoformat() + "Z"
         print(f"[INFO] /api/evaluate [{mode}] 분석 기준 시점: {timestamp_str}")
@@ -604,7 +831,7 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
                         metrics_context = "\n--- [Prometheus 메트릭] ---\n  메트릭 수집 실패\n"
                     timestamp_header = f"[분석 기준 시점: {timestamp_str}]\n\n"
                     full_context = timestamp_header + error_summary + rca_summary + metrics_context
-                    rag_query = _build_rag_query(results)
+                    rag_query = _build_rag_query(results, error_summary)
                     rag_texts = retriever.search_texts_only(rag_query)
                     payload["ai_analysis"] = llm.analyze(full_context, rag_texts)
                     if not isinstance(payload["ai_analysis"], str) or not payload["ai_analysis"].strip():
@@ -615,7 +842,7 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
             except Exception as e:
                 print(f"[WARN] hybrid ai_analysis 실패: {e}")
                 payload["ai_analysis"] = ""
-                payload["ai_status"] = "error"
+                payload["ai_status"] = _llm_error_status(e)
             elapsed = round(time.time() - t0, 3)
             response = {
                 "status": "success",
@@ -656,7 +883,7 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
             ai_status = "not_applicable"
             if error_summary != "정상 상태 (이상 노드 없음)":
                 try:
-                    rag_query = _build_rag_query([])
+                    rag_query = _build_rag_query([], error_summary)
                     rag_texts = retriever.search_texts_only(rag_query)
                     ai_analysis = llm.analyze(error_summary, rag_texts)
                     if not isinstance(ai_analysis, str) or not ai_analysis.strip():
@@ -665,7 +892,7 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
                 except Exception as e:
                     print(f"[WARN] llm_only ai_analysis 실패: {e}")
                     ai_analysis = ""
-                    ai_status = "error"
+                    ai_status = _llm_error_status(e)
             elapsed = round(time.time() - t0, 3)
             response = {
                 "status": "success",
@@ -688,6 +915,11 @@ def evaluate(mode: str = "hybrid", snapshot_id: str = ""):
                 })
             return response
 
+    except NetworkEvidenceCollectionError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)},
+        )
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
     finally:
@@ -721,6 +953,7 @@ def run_analysis():
 
     # 3. 의존성 그래프 + RCA
     graph = DependencyGraph(cache)
+    _augment_graph_with_network_evidence(graph)
     root_causes = graph.find_root_causes()
     print(f"[INFO] 근본원인: {len(root_causes)}건")
 
@@ -747,7 +980,7 @@ def run_analysis():
     full_context = timestamp_header + error_summary + rca_summary + metrics_context
 
     # 8. RAG 검색 (에러 키워드 기반 쿼리)
-    rag_query = _build_rag_query(root_causes)
+    rag_query = _build_rag_query(root_causes, error_summary)
     retriever_inst = Retriever()
     rag_docs = retriever_inst.search_texts_only(rag_query)
 

@@ -249,6 +249,8 @@ class ResourceCache:
             reason = ""
             message = ""
             exit_code = 0
+            last_terminated_reason = ""
+            last_exit_code = 0
 
             if cs.state:
                 if cs.state.waiting:
@@ -260,6 +262,15 @@ class ResourceCache:
                     reason = cs.state.terminated.reason or ""
                     exit_code = cs.state.terminated.exit_code or 0
 
+            last_terminated = getattr(
+                getattr(cs, "last_state", None),
+                "terminated",
+                None,
+            )
+            if last_terminated is not None:
+                last_terminated_reason = last_terminated.reason or ""
+                last_exit_code = last_terminated.exit_code or 0
+
             containers.append(MiniContainer(
                 name=cs.name,
                 image=image_map.get(cs.name, ""),
@@ -268,6 +279,8 @@ class ResourceCache:
                 message=message,
                 exit_code=exit_code,
                 restart_count=cs.restart_count or 0,
+                last_terminated_reason=last_terminated_reason,
+                last_exit_code=last_exit_code,
             ))
 
         pvc_names = []
@@ -311,6 +324,13 @@ class ResourceCache:
             error_reason = "Pending"
 
         for c in containers:
+            if (
+                c.state == "waiting"
+                and c.last_terminated_reason == "OOMKilled"
+            ):
+                pod_status = "ERROR"
+                error_reason = "OOMKilled"
+                break
             if c.state == "waiting" and c.reason in (
                 "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull",
                 "CreateContainerConfigError", "InvalidImageName",
@@ -332,11 +352,16 @@ class ResourceCache:
             phase=phase, node_name=spec.node_name or "",
             owner=owner, containers=containers,
             pvc_names=pvc_names, cm_names=cm_names, secret_names=secret_names,
+            labels=dict(meta.labels or {}),
             status=pod_status, error_reason=error_reason,
         )
 
     def _slim_deploy(self, deploy) -> MiniDeployment:
-        desired = deploy.spec.replicas or 1
+        desired = (
+            1
+            if deploy.spec.replicas is None
+            else deploy.spec.replicas
+        )
         available = deploy.status.available_replicas or 0
         ready = deploy.status.ready_replicas or 0
         status = "OK"

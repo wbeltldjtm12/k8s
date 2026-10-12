@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: kubein-17-memory-stress
+  namespace: sock-shop
+spec:
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: shipping
+  stressors:
+    memory:
+      workers: 1
+      size: 256MB

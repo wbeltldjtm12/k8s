@@ -141,17 +141,18 @@ curl http://localhost:8000/api/health | python3 -m json.tool
 
 ---
 
-## 5단계: 시나리오 파일 경로 맞추기
+## 5. Paper scenario bundle
 
-ablation 스크립트는 `SCENARIO_DIR` 환경변수로 시나리오 위치를 찾음.
+The reconstructed 20-scenario bundle is included at
+`cluster-port/sock-shop-scenarios/` and is the default runner path.
 
-> **재현성 주의:** 현재 저장소에는 20개 장애 scenario bundle
-> (`inject.sh`, `recover.sh`, `fault.yaml`)이 포함되어 있지 않습니다. 논문 실험에 쓴
-> 동일 bundle을 별도로 준비하고, 그 버전/커밋과 archive SHA-256을 실험 기록에 남겨야 합니다.
-> bundle의 공식 배포 위치가 정해지기 전에는 이 저장소만으로 end-to-end 재현할 수 없습니다.
+The source HWP records each scenario type, target and evaluation scope, but
+does not contain the original per-scenario YAML or shell commands. This bundle
+is a reproducible reconstruction cross-checked against `eval/ground_truth.json`.
+See the bundle README for injection, recovery, and observability limits.
 
-필수 구조:
-```bash
+Required structure:
+```text
 $SCENARIO_DIR/
 ├── 01-pod-kill/
 │   ├── inject.sh 또는 fault.yaml
@@ -162,7 +163,7 @@ $SCENARIO_DIR/
 
 절대 경로로 지정:
 ```bash
-export SCENARIO_DIR=/absolute/path/to/sock-shop-scenarios
+export SCENARIO_DIR="$PWD/cluster-port/sock-shop-scenarios"
 export GROUND_TRUTH_FILE="$PWD/eval/ground_truth.json"
 ```
 
@@ -178,11 +179,12 @@ bash cluster-port/scripts/03-pre-check-cluster.sh
 **모두 통과해야 실험 가능:**
 ```
 [OK]   클러스터 노드 3개 (Ready: 3)
-[OK]   sock-shop 안정 상태 (13 pods)
-[OK]   Chaos Mesh 전체 Pod 준비 완료 (5 pods)
+[OK]   sock-shop 안정 상태 (14 pods)
+[OK]   Chaos Mesh 전체 Pod 준비 완료 (7 pods)
+[OK]   scenario metadata 20/20 strict resolve
 [OK]   백엔드 API/Kubernetes/ChromaDB 정상 (http://localhost:8000)
 [OK]   baseline error_node_count=0 (dfs_only)
-[OK]   Ground Truth active 20개 / detectable=10 / 스키마 확인
+[OK]   Ground Truth active 20개 / detectable=11 / 스키마 확인
 [OK]   시나리오 디렉터리 20/20
 ===========================================
  결과: 통과/실패/경고 집계
@@ -208,9 +210,10 @@ bash cluster-port/scripts/05-ablation-5cycle-cluster.sh
 주요 실행 profile 변수:
 
 - `EXPECTED_NODE_COUNT` (기본 3), `REQUIRE_CHAOS_MESH` (기본 `true`)
-- `SCENARIO_MANIFEST`(기본 `eval/scenarios.txt`), `GROUND_TRUTH_FILE`, `API_BASE`, `EVAL_TIMEOUT_SECONDS`
-- `EXCLUDED_SCENARIOS_CSV`: 기본 `02-pod-failure,14-cpu-stress,17-memory-stress`.
-  빈 값(`EXCLUDED_SCENARIOS_CSV=`)을 명시하면 기본 제외를 해제합니다.
+- `SCENARIO_MANIFEST`(기본 `eval/scenarios.txt`), `SCENARIO_METADATA_FILE`,
+  `GROUND_TRUTH_FILE`, `API_BASE`, `EVAL_TIMEOUT_SECONDS`
+- `EXCLUDED_SCENARIOS_CSV`: 기본값은 빈 값이며 20개를 모두 실행합니다.
+  일부만 제외할 때 쉼표 구분 시나리오 ID를 명시합니다.
 
 `detectable=true` 장애를 정상 주입했지만 끝까지 찾지 못한 경우는 실험 오류가 아니라
 `status=valid`, `detected=false` false negative로 기록되어 다음 cycle을 계속합니다.

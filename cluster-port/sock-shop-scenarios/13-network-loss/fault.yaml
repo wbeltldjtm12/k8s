@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubein-13-network-loss
+  namespace: sock-shop
+spec:
+  action: loss
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: front-end
+  loss:
+    loss: "100"
+    correlation: "0"

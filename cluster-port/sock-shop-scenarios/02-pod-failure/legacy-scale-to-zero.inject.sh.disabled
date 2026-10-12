@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# 보존용 legacy 구현이다. Kubernetes의 replicas=0은 정상적인 workload suspend이므로
+# canonical runner가 실행하지 않도록 .disabled 확장자로 보관한다.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/scenario-lib.sh"
+init_state "$SCRIPT_DIR"; need_kubectl; need_deployment catalogue
+save_replicas catalogue
+log '02-pod-failure: catalogue Deployment를 0 replicas로 축소'
+kubectl scale deployment/catalogue -n "$NS" --replicas=0

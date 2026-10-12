@@ -8,6 +8,7 @@ set -euo pipefail
 NS="sock-shop"
 MANIFEST_URL="https://raw.githubusercontent.com/microservices-demo/microservices-demo/master/deploy/kubernetes/complete-demo.yaml"
 MANIFEST_LOCAL="$(dirname "$0")/../sock-shop-manifests/complete-demo.yaml"
+MONGO_IMAGE="${MONGO_IMAGE:-mongo:4.4}"
 
 echo "================================================="
 echo " sock-shop 클러스터 배포"
@@ -28,6 +29,9 @@ else
   MANIFEST="$MANIFEST_LOCAL"
   echo "[OK] 다운로드 완료"
 fi
+
+# MongoDB 5.0+ requires AVX and crashes on VMs that do not expose it.
+sed -i "s#image: mongo$#image: ${MONGO_IMAGE}#" "$MANIFEST"
 
 # ── 배포 ───────────────────────────────────────────────
 kubectl apply -f "$MANIFEST"

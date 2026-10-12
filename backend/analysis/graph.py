@@ -31,6 +31,7 @@ W3 = 2    # 에러 깊이 가중치
 W4 = 5    # 상태 가중치
 
 PRIORITY_MISSING   = 1   # 리소스 누락
+PRIORITY_RUNTIME   = 1   # 직접 관측된 컨테이너 런타임 실패
 PRIORITY_INFRA     = 2   # 인프라 (노드)
 PRIORITY_STORAGE   = 3   # 스토리지 (PVC, SC)
 PRIORITY_WORKLOAD  = 4   # 워크로드 (Pod, Deploy, RS 등)
@@ -121,6 +122,53 @@ class DependencyGraph:
 
         if cache is not None:
             self.build_graph(cache)
+
+    def add_network_evidence(self, evidences) -> int:
+        """Attach optional network-probe observations as graph root candidates.
+
+        Evidence is intentionally additive: the legacy graph stays unchanged
+        when the probe is absent or the experimental metric mode is disabled.
+        A source Pod depends on its observed network path, which lets the
+        existing reverse-BFS logic report the affected workload.
+        """
+        added = 0
+        for evidence in evidences:
+            source_node_id = self._node_id(
+                "Pod",
+                evidence.namespace,
+                evidence.source_pod,
+            )
+            source_node = self.nodes.get(source_node_id)
+            if source_node is None or source_node.kind != "Pod":
+                continue
+            source_labels = getattr(source_node.raw, "labels", {}) or {}
+            if source_labels.get("name") != evidence.source_workload:
+                continue
+
+            node_name = (
+                f"{evidence.source_workload}->{evidence.target}"
+                f"[{evidence.probe}]@{evidence.source_pod}"
+            )
+            node_id = self._node_id("NetworkPath", evidence.namespace, node_name)
+            existing = self.nodes.get(node_id)
+            if existing and existing.status == "ERROR" and evidence.status != "ERROR":
+                continue
+            node = GraphNode(
+                id=node_id,
+                kind="NetworkPath",
+                name=node_name,
+                namespace=evidence.namespace,
+                status=evidence.status,
+                error_reason=evidence.reason,
+                error_message=evidence.message,
+                priority=PRIORITY_INFRA,
+                is_system=False,
+                raw=evidence,
+            )
+            self._add_node(node)
+            self._add_edge(source_node_id, node_id)
+            added += 1
+        return added
 
     def _node_id(self, kind: str, namespace: str, name: str) -> str:
         """노드 고유 ID 생성."""
@@ -336,6 +384,8 @@ class DependencyGraph:
     def _eval_pod(self, gnode: GraphNode, item: MiniPod) -> None:
         gnode.status = item.status
         gnode.error_reason = item.error_reason
+        if item.error_reason == "OOMKilled":
+            gnode.priority = PRIORITY_RUNTIME
         gnode.error_message = f"Phase: {item.phase}"
         if item.error_reason:
             gnode.error_message += f", Reason: {item.error_reason}"
@@ -419,12 +469,10 @@ class DependencyGraph:
             for pod in pods:
                 if pod.namespace != svc.namespace:
                     continue
-                matched = True
-                for v in svc.selector.values():
-                    if v.lower() not in pod.name.lower():
-                        matched = False
-                        break
-                if matched:
+                if all(
+                    pod.labels.get(key) == value
+                    for key, value in svc.selector.items()
+                ):
                     pod_id = self._node_id("Pod", pod.namespace, pod.name)
                     self._add_edge(svc_id, pod_id)
 
@@ -445,7 +493,7 @@ class DependencyGraph:
     # ─── 누락 리소스 감지 ─────────────────────
 
     @staticmethod
-    def _should_promote_missing_dependency(pod: MiniPod) -> bool:
+    def _should_promote_missing_dependency(pod: MiniPod, kind: str) -> bool:
         """Return true only when a missing dependency is an active startup failure.
 
         A ConfigMap or Secret can disappear after a Pod has already mounted it.
@@ -455,10 +503,24 @@ class DependencyGraph:
         a live dependency is promoted only when kubelet explicitly reports the
         configuration-startup failure.
         """
-        return (
-            pod.phase not in {"Succeeded", "Failed"}
-            and pod.status == "ERROR"
+        if pod.phase in {"Succeeded", "Failed"}:
+            return False
+
+        if (
+            pod.status == "ERROR"
             and pod.error_reason == "CreateContainerConfigError"
+        ):
+            return True
+
+        # A missing PVC is surfaced by kubelet before any container starts.
+        # In that case the Pod remains Pending rather than reporting a
+        # CreateContainerConfigError. Limit this exception to PVC so a generic
+        # Pending Pod does not resurrect the stale ConfigMap/Secret false
+        # positives that this guard was introduced to avoid.
+        return (
+            kind == "PVC"
+            and pod.phase == "Pending"
+            and pod.status == "WARNING"
         )
 
     def _add_missing_dependency(
@@ -496,22 +558,243 @@ class DependencyGraph:
         pvc_exists = {(p.namespace, p.name) for p in cache.pvcs}
 
         for pod in cache.pods:
-            if not self._should_promote_missing_dependency(pod):
-                continue
-
             for cm_name in pod.cm_names:
-                if (pod.namespace, cm_name) not in cache.cm_exists:
+                if (
+                    (pod.namespace, cm_name) not in cache.cm_exists
+                    and self._should_promote_missing_dependency(pod, "ConfigMap")
+                ):
                     self._add_missing_dependency(pod, "ConfigMap", cm_name)
 
             for secret_name in pod.secret_names:
-                if (pod.namespace, secret_name) not in cache.secret_exists:
+                if (
+                    (pod.namespace, secret_name) not in cache.secret_exists
+                    and self._should_promote_missing_dependency(pod, "Secret")
+                ):
                     self._add_missing_dependency(pod, "Secret", secret_name)
 
             for pvc_name in pod.pvc_names:
-                if (pod.namespace, pvc_name) not in pvc_exists:
+                if (
+                    (pod.namespace, pvc_name) not in pvc_exists
+                    and self._should_promote_missing_dependency(pod, "PVC")
+                ):
                     self._add_missing_dependency(pod, "PVC", pvc_name)
 
     # ─── 근본 원인 분석 ───────────────────────
+
+    @staticmethod
+    def _is_non_ok(node: Optional[GraphNode]) -> bool:
+        return node is not None and node.status in {"ERROR", "WARNING"}
+
+    def _prune_missing_dependency_symptoms(
+        self,
+        results: List[RCAResult],
+    ) -> List[RCAResult]:
+        """Remove aggregate symptoms fully explained by a missing dependency.
+
+        A kubelet startup failure caused by a missing Secret, ConfigMap, or PVC
+        commonly creates lower-confidence rollout and endpoint symptoms. Those
+        aggregates are redundant only when every failing direct child is one of
+        the Pods causally linked to the missing dependency. Independent failures
+        and mixed rollouts therefore remain visible.
+        """
+        missing_ids = {
+            node_id
+            for node_id, node in self.nodes.items()
+            if (
+                node.kind in {"Secret", "ConfigMap", "PVC"}
+                and node.status == "ERROR"
+                and node.error_reason == "Missing"
+            )
+        }
+        if not missing_ids:
+            return results
+
+        causal_pods = {
+            pod_id
+            for missing_id in missing_ids
+            for pod_id in self.reverse_edges.get(missing_id, set())
+            if (
+                self.nodes.get(pod_id) is not None
+                and self.nodes[pod_id].kind == "Pod"
+                and self._is_non_ok(self.nodes[pod_id])
+            )
+        }
+        if not causal_pods:
+            return results
+
+        suppressed_rs: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if node.kind != "ReplicaSet" or not self._is_non_ok(node):
+                continue
+            failing_pods = {
+                child_id
+                for child_id in self.reverse_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "Pod"
+                    and self._is_non_ok(self.nodes[child_id])
+                )
+            }
+            if failing_pods and failing_pods <= causal_pods:
+                suppressed_rs.add(node_id)
+
+        suppressed_deployments: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if node.kind != "Deployment" or not self._is_non_ok(node):
+                continue
+            failing_rs = {
+                child_id
+                for child_id in self.reverse_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "ReplicaSet"
+                    and self._is_non_ok(self.nodes[child_id])
+                )
+            }
+            if failing_rs and failing_rs <= suppressed_rs:
+                suppressed_deployments.add(node_id)
+
+        suppressed_services: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if (
+                node.kind != "Service"
+                or node.error_reason != "NoEndpoints"
+                or not self._is_non_ok(node)
+            ):
+                continue
+            failing_pods = {
+                child_id
+                for child_id in self.forward_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "Pod"
+                    and self._is_non_ok(self.nodes[child_id])
+                )
+            }
+            if failing_pods and failing_pods <= causal_pods:
+                suppressed_services.add(node_id)
+
+        suppressed = (
+            suppressed_rs
+            | suppressed_deployments
+            | suppressed_services
+        )
+        if not suppressed:
+            return results
+        return [
+            result
+            for result in results
+            if result.root_cause.id not in suppressed
+        ]
+
+    def _prune_network_path_symptoms(
+        self,
+        results: List[RCAResult],
+    ) -> List[RCAResult]:
+        """Remove rollout/endpoint symptoms explained by probe evidence.
+
+        NetworkChaos can make an application's own readiness and liveness
+        responses time out. Deployment, ReplicaSet, and Service errors then
+        describe the blast radius rather than independent root causes. Suppress
+        those aggregates only when every failing child Pod is directly attached
+        to a non-OK NetworkPath; mixed failures remain visible.
+        """
+        network_ids = {
+            node_id
+            for node_id, node in self.nodes.items()
+            if node.kind == "NetworkPath" and self._is_non_ok(node)
+        }
+        if not network_ids:
+            return results
+
+        causal_pods = {
+            pod_id
+            for network_id in network_ids
+            for pod_id in self.reverse_edges.get(network_id, set())
+            if (
+                self.nodes.get(pod_id) is not None
+                and self.nodes[pod_id].kind == "Pod"
+            )
+        }
+        if not causal_pods:
+            return results
+
+        suppressed_rs: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if node.kind != "ReplicaSet" or not self._is_non_ok(node):
+                continue
+            member_pods = {
+                child_id
+                for child_id in self.reverse_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "Pod"
+                )
+            }
+            failing_pods = {
+                pod_id
+                for pod_id in member_pods
+                if self._is_non_ok(self.nodes[pod_id])
+            }
+            if member_pods & causal_pods and failing_pods <= causal_pods:
+                suppressed_rs.add(node_id)
+
+        suppressed_deployments: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if node.kind != "Deployment" or not self._is_non_ok(node):
+                continue
+            member_rs = {
+                child_id
+                for child_id in self.reverse_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "ReplicaSet"
+                )
+            }
+            failing_rs = {
+                rs_id
+                for rs_id in member_rs
+                if self._is_non_ok(self.nodes[rs_id])
+            }
+            if member_rs & suppressed_rs and failing_rs <= suppressed_rs:
+                suppressed_deployments.add(node_id)
+
+        suppressed_services: Set[str] = set()
+        for node_id, node in self.nodes.items():
+            if (
+                node.kind != "Service"
+                or node.error_reason != "NoEndpoints"
+                or not self._is_non_ok(node)
+            ):
+                continue
+            selected_pods = {
+                child_id
+                for child_id in self.forward_edges.get(node_id, set())
+                if (
+                    self.nodes.get(child_id) is not None
+                    and self.nodes[child_id].kind == "Pod"
+                )
+            }
+            failing_pods = {
+                pod_id
+                for pod_id in selected_pods
+                if self._is_non_ok(self.nodes[pod_id])
+            }
+            if selected_pods & causal_pods and failing_pods <= causal_pods:
+                suppressed_services.add(node_id)
+
+        suppressed = (
+            suppressed_rs
+            | suppressed_deployments
+            | suppressed_services
+        )
+        if not suppressed:
+            return results
+        return [
+            result
+            for result in results
+            if result.root_cause.id not in suppressed
+        ]
 
     def find_root_causes(self) -> List[RCAResult]:
         """
@@ -579,8 +862,11 @@ class DependencyGraph:
                 result.build_summary()
                 results.append(result)
 
+        results = self._prune_missing_dependency_symptoms(results)
+        results = self._prune_network_path_symptoms(results)
         results.sort(key=lambda r: (
             STATUS_ORDER.get(r.root_cause_status, 2),
+            r.root_cause_priority,
             -r.score
         ))
 
@@ -635,6 +921,8 @@ class DependencyGraph:
                 result.build_summary()
                 results.append(result)
 
+        results = self._prune_missing_dependency_symptoms(results)
+        results = self._prune_network_path_symptoms(results)
         results.sort(key=lambda r: (STATUS_ORDER.get(r.root_cause_status, 2), -r.score))
         return results
 

@@ -7,15 +7,27 @@ Prometheus 메트릭 수집 클라이언트
 - 재시작 횟수 급증 감지
 - 네트워크 에러율
 """
+import math
 import os
+import threading
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 
 import requests
 
 
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://192.168.0.12:30090")
+METRICS_CONTEXT_QUERY_COUNT = 7
+DEFAULT_PROMETHEUS_REQUEST_TIMEOUT_SECONDS = 3.0
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 @dataclass
@@ -31,29 +43,118 @@ class MetricResult:
     points: List[MetricPoint] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class MetricsQueryStatus:
+    attempts: int
+    successes: int
+    failures: int
+    failure_categories: Dict[str, int] = field(default_factory=dict)
+
+
 class MetricsClient:
     """Prometheus HTTP API 클라이언트"""
 
     def __init__(self, url: str = None):
         self.url = (url or PROMETHEUS_URL).rstrip("/")
+        self.request_timeout = _positive_float_env(
+            "PROMETHEUS_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_PROMETHEUS_REQUEST_TIMEOUT_SECONDS,
+        )
+        self._query_attempts = 0
+        self._query_successes = 0
+        self._query_failures = 0
+        self._query_failure_categories: Dict[str, int] = {}
+        self._query_status_lock = threading.Lock()
 
-    def query_instant(self, promql: str) -> List[MetricResult]:
-        """현재 시점 단일 쿼리"""
+    def get_query_status(self) -> MetricsQueryStatus:
+        """Return a point-in-time copy of cumulative query outcomes."""
+        with self._query_status_lock:
+            return MetricsQueryStatus(
+                attempts=self._query_attempts,
+                successes=self._query_successes,
+                failures=self._query_failures,
+                failure_categories=dict(self._query_failure_categories),
+            )
+
+    def _record_query_attempt(self) -> None:
+        with self._query_status_lock:
+            self._query_attempts += 1
+
+    def _record_query_success(self) -> None:
+        with self._query_status_lock:
+            self._query_successes += 1
+
+    def _record_query_failure(self, category: str) -> None:
+        with self._query_status_lock:
+            self._query_failures += 1
+            self._query_failure_categories[category] = (
+                self._query_failure_categories.get(category, 0) + 1
+            )
+
+    def _decode_query_response(
+        self,
+        response: requests.Response,
+        parser: Callable[[list], List[MetricResult]],
+    ) -> List[MetricResult]:
+        try:
+            data = response.json()
+        except (TypeError, ValueError):
+            self._record_query_failure("invalid_json")
+            print("[WARN] Prometheus query failed [invalid_json]")
+            return []
+
+        if not isinstance(data, dict):
+            self._record_query_failure("invalid_schema")
+            print("[WARN] Prometheus query failed [invalid_schema]")
+            return []
+
+        if "status" not in data:
+            self._record_query_failure("invalid_schema")
+            print("[WARN] Prometheus query failed [invalid_schema]")
+            return []
+        if data["status"] != "success":
+            self._record_query_failure("unsuccessful_status")
+            print("[WARN] Prometheus query failed [unsuccessful_status]")
+            return []
+
+        payload = data.get("data")
+        if not isinstance(payload, dict) or not isinstance(payload.get("result"), list):
+            self._record_query_failure("invalid_schema")
+            print("[WARN] Prometheus query failed [invalid_schema]")
+            return []
+
+        try:
+            parsed = parser(payload["result"])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            self._record_query_failure("parse_error")
+            print("[WARN] Prometheus query failed [parse_error]")
+            return []
+
+        self._record_query_success()
+        return parsed
+
+    def query_instant(
+        self,
+        promql: str,
+        reference_time: Optional[float] = None,
+    ) -> List[MetricResult]:
+        """단일 시점 쿼리. reference_time이 주어지면 모든 관련 쿼리를 같은 시점에 고정."""
+        self._record_query_attempt()
+        params = {"query": promql}
+        if reference_time is not None:
+            params["time"] = str(reference_time)
         try:
             resp = requests.get(
                 f"{self.url}/api/v1/query",
-                params={"query": promql},
-                timeout=10,
+                params=params,
+                timeout=self.request_timeout,
             )
             resp.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            print(f"[WARN] Prometheus 쿼리 실패 ({promql[:50]}...): {e}")
+        except requests.exceptions.RequestException:
+            self._record_query_failure("request_error")
+            print("[WARN] Prometheus query failed [request_error]")
             return []
-        data = resp.json()
-        if data["status"] != "success":
-            print(f"[WARN] Prometheus 응답 오류: {data}")
-            return []
-        return self._parse_vector(data["data"]["result"])
+        return self._decode_query_response(resp, self._parse_vector)
 
     def query_range(
         self,
@@ -68,6 +169,7 @@ class MetricsClient:
         else:
             end = datetime.utcnow()
         start = end - timedelta(minutes=minutes)
+        self._record_query_attempt()
         try:
             resp = requests.get(
                 f"{self.url}/api/v1/query_range",
@@ -77,17 +179,14 @@ class MetricsClient:
                     "end": end.isoformat() + "Z",
                     "step": step,
                 },
-                timeout=10,
+                timeout=self.request_timeout,
             )
             resp.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            print(f"[WARN] Prometheus range 쿼리 실패 ({promql[:50]}...): {e}")
+        except requests.exceptions.RequestException:
+            self._record_query_failure("request_error")
+            print("[WARN] Prometheus query failed [request_error]")
             return []
-        data = resp.json()
-        if data["status"] != "success":
-            print(f"[WARN] Prometheus range 응답 오류: {data}")
-            return []
-        return self._parse_matrix(data["data"]["result"])
+        return self._decode_query_response(resp, self._parse_matrix)
 
     def _parse_vector(self, results: list) -> List[MetricResult]:
         parsed = []
@@ -307,8 +406,28 @@ class MetricsAnalyzer:
         self, namespace: str = "", reference_time: Optional[float] = None
     ) -> str:
         """LLM에 전달할 메트릭 컨텍스트 문자열 생성. reference_time으로 시점 고정 가능."""
+        status_reader = getattr(self.mc, "get_query_status", None)
+        status_before = status_reader() if callable(status_reader) else None
         anomalies = self.detect_anomalies(namespace, reference_time=reference_time)
+        status_after = status_reader() if callable(status_reader) else None
         lines = ["\n--- [Prometheus 메트릭 이상 징후] ---\n"]
+
+        query_attempts = 0
+        query_successes = 0
+        query_failures = 0
+        if status_before is not None and status_after is not None:
+            query_attempts = status_after.attempts - status_before.attempts
+            query_successes = status_after.successes - status_before.successes
+            query_failures = status_after.failures - status_before.failures
+
+        if query_attempts > 0 and query_failures == query_attempts:
+            lines.append("  수집 실패 — 정상 여부 판단 불가")
+            return "\n".join(lines)
+
+        if query_failures > 0:
+            lines.append(
+                "  경고: 일부 메트릭 수집 실패 — 성공한 데이터 기준으로 판단"
+            )
 
         if anomalies["high_cpu_nodes"]:
             lines.append("■ CPU 과부하 노드:")
@@ -345,7 +464,10 @@ class MetricsAnalyzer:
             for d in anomalies["network_drops"]:
                 lines.append(f"  - {d['node']} ({d['device']}): 드롭률 {d['drop_rate']}/s")
 
-        if len(lines) == 1:
-            lines.append("  이상 징후 없음 (모든 메트릭 정상 범위)")
+        if not any(anomalies.values()):
+            if query_failures > 0 and query_successes > 0:
+                lines.append("  성공적으로 수집된 메트릭에서는 이상 징후 없음")
+            else:
+                lines.append("  이상 징후 없음 (모든 메트릭 정상 범위)")
 
         return "\n".join(lines)

@@ -1,0 +1,18 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: kubein-12-network-delay
+  namespace: sock-shop
+spec:
+  action: delay
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: payment
+  delay:
+    latency: 1000ms
+    correlation: "25"
+    jitter: 0ms

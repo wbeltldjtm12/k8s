@@ -1,0 +1,22 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: IOChaos
+metadata:
+  name: kubein-15-io-delay
+  namespace: sock-shop
+spec:
+  action: latency
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: carts-db
+      kubein-iochaos-target: "true"
+  volumePath: /data/db
+  path: /
+  methods:
+    - read
+    - write
+  delay: 100ms
+  percent: 100

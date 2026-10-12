@@ -30,7 +30,7 @@
     "target": "catalogue",
     "expected_rc_kind": "Deployment",
     "expected_rc_name_contains": "catalogue",
-    "expected_rc_reason": "Unavailable",
+    "expected_rc_reason": "NoAvailableReplicas",
     "detectable": true,
     "description": "catalogue Pod failure",
     "expected_affected": [
@@ -134,9 +134,9 @@
   },
   "05-oomkill": {
     "target": "orders",
-    "expected_rc_kind": "Deployment",
+    "expected_rc_kind": "Pod",
     "expected_rc_name_contains": "orders",
-    "expected_rc_reason": "Unavailable",
+    "expected_rc_reason": "OOMKilled",
     "detectable": true,
     "description": "orders OOMKilled",
     "expected_affected": [
@@ -427,10 +427,29 @@
     ]
   },
   "07-liveness-probe": {
+    "target": "catalogue",
+    "expected_rc_kind": "ReplicaSet",
+    "expected_rc_name_contains": "catalogue",
+    "expected_rc_reason": "ReplicasMismatch",
+    "detectable": true,
     "description": "catalogue의 livenessProbe를 잘못된 경로로 변경하여 Pod가 반복 재시작됨",
-    "root_cause": "Pod/catalogue",
-    "root_cause_kind": "Pod",
-    "detectable": false,
-    "limit_reason": "Liveness 실패로 인한 재시작이 빠르게 반복되어 스냅샷 시점에 Running 상태"
+    "expected_affected": [
+      {
+        "kind": "Pod",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "ReplicaSet",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Deployment",
+        "name_contains": "catalogue"
+      },
+      {
+        "kind": "Service",
+        "name_contains": "catalogue"
+      }
+    ]
   }
 }

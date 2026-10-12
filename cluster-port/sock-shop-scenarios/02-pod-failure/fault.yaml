@@ -1,0 +1,14 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kubein-02-pod-failure
+  namespace: sock-shop
+spec:
+  action: pod-failure
+  mode: one
+  duration: 120s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: catalogue

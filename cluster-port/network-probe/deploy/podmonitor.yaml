@@ -1,0 +1,32 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: kubein-network-probe
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - sock-shop
+  selector:
+    matchLabels:
+      kubein.io/network-probe: "true"
+  podMetricsEndpoints:
+    - port: netprobe
+      path: /metrics
+      interval: 3s
+      scrapeTimeout: 2s
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_name
+          targetLabel: source_pod
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_name
+          targetLabel: source_workload
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_kubein_io_network_probe_type
+          targetLabel: probe
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_kubein_io_network_probe_target
+          targetLabel: target

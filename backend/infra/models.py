@@ -15,6 +15,8 @@ class MiniContainer:
     message: str
     exit_code: int
     restart_count: int
+    last_terminated_reason: str = ""
+    last_exit_code: int = 0
 
 
 @dataclass(slots=True)
@@ -28,6 +30,7 @@ class MiniPod:
     pvc_names: List[str]
     cm_names: List[str]
     secret_names: List[str]
+    labels: Dict[str, str] = field(default_factory=dict)
     status: str = "OK"
     error_reason: str = ""
 

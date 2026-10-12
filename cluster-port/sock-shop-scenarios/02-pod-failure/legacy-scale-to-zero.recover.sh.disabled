@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# legacy scale-to-zero 주입과 한 쌍인 보존용 복구 스크립트다.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/scenario-lib.sh"
+init_state "$SCRIPT_DIR"; need_kubectl
+restore_replicas catalogue
+wait_rollout catalogue

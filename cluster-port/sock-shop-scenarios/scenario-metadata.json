@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "observation_settle_seconds": 5,
+    "recovery_settle_seconds": 0
+  },
+  "scenarios": {
+    "12-network-delay": {
+      "observation_settle_seconds": 5,
+      "recovery_settle_seconds": 12
+    }
+  }
+}

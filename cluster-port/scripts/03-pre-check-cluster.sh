@@ -2,7 +2,7 @@
 # 03-pre-check-cluster.sh
 # 클러스터 환경에서 KubeIn 실험 직전 사전 점검
 # 변경점 vs 단일노드 pre-check.sh:
-#   - SCENARIO_DIR: 환경변수로 주입 (기본값 ~/kubein/sock-shop)
+#   - SCENARIO_DIR: environment override (default: repository scenario bundle)
 #   - API_BASE: 환경변수로 주입 (기본값 localhost:8000)
 #   - EXPECTED_NODE_COUNT/REQUIRE_CHAOS_MESH로 실행 profile 지정
 
@@ -11,16 +11,21 @@ set -uo pipefail
 # ── 경로 설정 (환경변수로 오버라이드 가능) ─────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SCENARIO_DIR="${SCENARIO_DIR:-$HOME/kubein/sock-shop}"
+SCENARIO_DIR="${SCENARIO_DIR:-$REPO_ROOT/cluster-port/sock-shop-scenarios}"
 API_BASE="${API_BASE:-http://localhost:8000}"
 CACHE_API="$API_BASE/api/cache/invalidate"
 EVAL_API="$API_BASE/api/evaluate"
 HEALTH_API="$API_BASE/api/health"
+LLM_HEALTH_API="$API_BASE/api/health/llm"
 NS="sock-shop"
 EXPECTED_NODE_COUNT="${EXPECTED_NODE_COUNT:-3}"
+EXPECTED_DETECTABLE_COUNT="${EXPECTED_DETECTABLE_COUNT:-11}"
 REQUIRE_CHAOS_MESH="${REQUIRE_CHAOS_MESH:-true}"
+LLM_PREFLIGHT="${LLM_PREFLIGHT:-true}"
 GROUND_TRUTH_FILE="${GROUND_TRUTH_FILE:-}"
 SCENARIO_MANIFEST="${SCENARIO_MANIFEST:-$REPO_ROOT/eval/scenarios.txt}"
+SCENARIO_METADATA_FILE="${SCENARIO_METADATA_FILE:-$SCENARIO_DIR/scenario-metadata.json}"
+SCENARIO_METADATA_VALIDATOR="${SCENARIO_METADATA_VALIDATOR:-$REPO_ROOT/eval/validate-scenario-metadata.py}"
 
 if [ ! -f "$SCENARIO_MANIFEST" ]; then
   echo "[오류] scenario manifest를 찾을 수 없음: $SCENARIO_MANIFEST" >&2
@@ -43,9 +48,30 @@ warn() { echo "[경고] $*"; warn_count=$((warn_count+1)); }
 echo "================================================="
 echo " KubeIn 클러스터 사전 점검"
 echo " SCENARIO_DIR: $SCENARIO_DIR"
+echo " METADATA    : $SCENARIO_METADATA_FILE"
 echo " API_BASE    : $API_BASE"
 echo " EXPECTED_NODE_COUNT: $EXPECTED_NODE_COUNT"
 echo "================================================="
+
+# 0) 시나리오별 관측 settle metadata
+if [ ! -f "$SCENARIO_METADATA_VALIDATOR" ]; then
+  fail "scenario metadata validator를 찾을 수 없음: $SCENARIO_METADATA_VALIDATOR"
+elif [ ! -f "$SCENARIO_METADATA_FILE" ]; then
+  fail "scenario metadata를 찾을 수 없음: $SCENARIO_METADATA_FILE"
+elif METADATA_REPORT="$(
+  python3 "$SCENARIO_METADATA_VALIDATOR" \
+    --metadata "$SCENARIO_METADATA_FILE" \
+    --manifest "$SCENARIO_MANIFEST" 2>&1
+)"; then
+  METADATA_COUNT="$(printf '%s\n' "$METADATA_REPORT" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$METADATA_COUNT" -eq "${#SCENARIOS[@]}" ]; then
+    ok "scenario metadata ${METADATA_COUNT}/${#SCENARIOS[@]} strict resolve"
+  else
+    fail "scenario metadata resolve 수 불일치: ${METADATA_COUNT}/${#SCENARIOS[@]}"
+  fi
+else
+  fail "scenario metadata 검증 실패: $METADATA_REPORT"
+fi
 
 # 1) kubectl 연결 + 노드 수 확인
 NODE_COUNT="$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
@@ -63,7 +89,7 @@ fi
 
 # 2) sock-shop Pod 상태
 BAD_PODS="$(kubectl get pods -n "$NS" --no-headers 2>/dev/null \
-  | awk '{n=split($2, ready, "/"); if (n != 2 || ready[2] == 0 || ready[1] != ready[2] || $3 != "Running") print $1}')"
+  | awk '$3 == "Terminating" {next} {n=split($2, ready, "/"); if (n != 2 || ready[2] == 0 || ready[1] != ready[2] || $3 != "Running") print $1}')"
 POD_COUNT="$(kubectl get pods -n "$NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 
 if [ -z "${BAD_PODS:-}" ] && [ "${POD_COUNT:-0}" -ge 1 ]; then
@@ -87,6 +113,77 @@ else
 fi
 
 # 4) 백엔드 API
+check_chaos_residue() {
+  local resource
+  for resource in podchaos networkchaos dnschaos iochaos stresschaos podiochaos; do
+    kubectl get "$resource" -n "$NS" -o name 2>/dev/null || true
+  done
+}
+
+CHAOS_RESIDUE="$(check_chaos_residue)"
+if [ -z "$CHAOS_RESIDUE" ]; then
+  ok "sock-shop namespace에 잔류 Chaos 실험 없음"
+else
+  fail "잔류 Chaos 실험 발견: $(printf '%s' "$CHAOS_RESIDUE" | tr '\n' ' ')"
+fi
+
+EXPERIMENTAL_OBJECTS="$(
+  kubectl get configmap,secret,pvc -n "$NS" -o name 2>/dev/null \
+    | grep -E '(^|/)kubein-' || true
+)"
+DEPLOYMENT_MARKERS="$(
+  kubectl get deployments -n "$NS" -o json 2>/dev/null \
+    | grep -Eo '__kubein_[A-Za-z0-9_-]*|registry\.invalid/kubein[^" ]*|kubein-(missing-pvc|front-end-bad-config|catalogue-db[^" ]*secret)' \
+    | sort -u || true
+)"
+if [ -z "$EXPERIMENTAL_OBJECTS" ] && [ -z "$DEPLOYMENT_MARKERS" ]; then
+  ok "수동 장애 주입 잔류 리소스/Deployment marker 없음"
+else
+  fail "수동 장애 주입 잔류 발견: objects=${EXPERIMENTAL_OBJECTS:-none}, markers=${DEPLOYMENT_MARKERS:-none}"
+fi
+
+SHIPPING_READ_ONLY_ROOTFS="$(
+  kubectl get deployment shipping -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}' \
+    2>/dev/null || true
+)"
+if [ "$SHIPPING_READ_ONLY_ROOTFS" = "true" ]; then
+  ok "shipping readOnlyRootFilesystem baseline=true"
+else
+  fail "shipping DNSChaos 준비 상태가 잔류함: readOnlyRootFilesystem=${SHIPPING_READ_ONLY_ROOTFS:-missing}"
+fi
+
+CARTS_DB_READ_ONLY_ROOTFS="$(
+  kubectl get deployment carts-db -n "$NS" \
+    -o jsonpath='{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}' \
+    2>/dev/null || true
+)"
+if [ "$CARTS_DB_READ_ONLY_ROOTFS" = "true" ]; then
+  ok "carts-db readOnlyRootFilesystem baseline=true"
+else
+  fail "carts-db IOChaos 준비 상태가 잔류함: readOnlyRootFilesystem=${CARTS_DB_READ_ONLY_ROOTFS:-missing}"
+fi
+
+DNS_TARGET_RESIDUE="$(
+  kubectl get pods -n "$NS" -l kubein-dnschaos-target=true -o name \
+    2>/dev/null || true
+)"
+if [ -z "$DNS_TARGET_RESIDUE" ]; then
+  ok "DNSChaos 준비용 target Pod label 잔류 없음"
+else
+  fail "DNSChaos 준비용 target Pod 잔류: $DNS_TARGET_RESIDUE"
+fi
+
+IO_TARGET_RESIDUE="$(
+  kubectl get pods -n "$NS" -l kubein-iochaos-target=true -o name \
+    2>/dev/null || true
+)"
+if [ -z "$IO_TARGET_RESIDUE" ]; then
+  ok "IOChaos 준비용 target Pod label 잔류 없음"
+else
+  fail "IOChaos 준비용 target Pod 잔류: $IO_TARGET_RESIDUE"
+fi
+
 if HEALTH_RESPONSE="$(curl -fsS --connect-timeout 5 --max-time 15 "$HEALTH_API")" \
   && printf '%s' "$HEALTH_RESPONSE" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
@@ -98,6 +195,22 @@ else
 fi
 
 # 5) baseline error_node_count
+if [ "$LLM_PREFLIGHT" = "true" ]; then
+  if LLM_HEALTH_RESPONSE="$(curl -fsS --connect-timeout 10 --max-time 120 "$LLM_HEALTH_API")" \
+    && printf '%s' "$LLM_HEALTH_RESPONSE" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if d.get("status") != "ready": raise SystemExit(1)
+if not isinstance(d.get("model"), str) or not d["model"].strip(): raise SystemExit(1)' 2>/dev/null; then
+    ok "LLM 연결/auth/model 사전 점검 통과"
+  else
+    fail "LLM 연결/auth/model 사전 점검 실패 ($LLM_HEALTH_API)"
+  fi
+elif [ "$LLM_PREFLIGHT" = "false" ]; then
+  warn "LLM preflight 비활성화"
+else
+  fail "LLM_PREFLIGHT는 true 또는 false여야 함: $LLM_PREFLIGHT"
+fi
+
 if ! curl -fsS --connect-timeout 5 --max-time 15 -X POST "$CACHE_API" >/dev/null; then
   fail "baseline cache 무효화 API 실패"
 elif ! BASELINE_RESPONSE="$(curl -fsS --connect-timeout 5 --max-time 60 \
@@ -133,12 +246,15 @@ fi
 if [ -z "$GROUND_TRUTH_FILE" ] || [ ! -f "$GROUND_TRUTH_FILE" ]; then
   fail "ground_truth.json을 찾을 수 없음 (GROUND_TRUTH_FILE로 지정 가능)"
 else
-  GT_REPORT="$(python3 - "$GROUND_TRUTH_FILE" "${SCENARIOS[@]}" <<'PY'
+  GT_REPORT="$(python3 - "$GROUND_TRUTH_FILE" "$EXPECTED_DETECTABLE_COUNT" "${SCENARIOS[@]}" <<'PY'
 import json
 import sys
 
-path, *active = sys.argv[1:]
+path, expected_detectable_text, *active = sys.argv[1:]
 try:
+    expected_detectable_count = int(expected_detectable_text)
+    if expected_detectable_count < 0:
+        raise ValueError("expected detectable count must be non-negative")
     with open(path, "r", encoding="utf-8") as stream:
         data = json.load(stream)
     if not isinstance(data, dict):
@@ -170,7 +286,7 @@ try:
     )
     if missing:
         raise SystemExit(1)
-    if schema_errors or detectable_count != 10:
+    if schema_errors or detectable_count != expected_detectable_count:
         raise SystemExit(3)
     raise SystemExit(0)
 except Exception as exc:
@@ -181,7 +297,7 @@ PY
   GT_STATUS=$?
   IFS='|' read -r GT_COUNT GT_MISSING GT_EXTRA GT_DETECTABLE GT_SCHEMA <<< "$GT_REPORT"
   if [ "$GT_STATUS" -eq 0 ]; then
-    ok "Ground Truth active 20개 / detectable=10 / 스키마 확인 ($GROUND_TRUTH_FILE)"
+    ok "Ground Truth active 20개 / detectable=$EXPECTED_DETECTABLE_COUNT / 스키마 확인 ($GROUND_TRUTH_FILE)"
     [ -n "${GT_EXTRA:-}" ] && warn "Ground Truth legacy/extra key: $GT_EXTRA"
   elif [ "$GT_STATUS" -eq 1 ]; then
     fail "Ground Truth active key 누락: ${GT_MISSING:-알 수 없음}"

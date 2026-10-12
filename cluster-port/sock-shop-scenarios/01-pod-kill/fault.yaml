@@ -1,0 +1,14 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kubein-01-pod-kill
+  namespace: sock-shop
+spec:
+  action: pod-kill
+  mode: one
+  duration: 30s
+  selector:
+    namespaces:
+      - sock-shop
+    labelSelectors:
+      name: carts-db

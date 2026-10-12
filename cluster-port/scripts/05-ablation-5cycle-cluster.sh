@@ -5,31 +5,53 @@
 # 사용법:
 #   bash 05-ablation-5cycle-cluster.sh
 #   CYCLES=3 bash 05-ablation-5cycle-cluster.sh    # 사이클 수 변경
-#   SCENARIO_DIR=/opt/kubein/sock-shop bash ...    # 경로 변경
+#   SCENARIO_DIR=/custom/path/sock-shop-scenarios bash ...    # 경로 변경
 
 set -uo pipefail
 
-SCENARIO_DIR="${SCENARIO_DIR:-$HOME/kubein/sock-shop}"
+RUN_LOCK_FILE="${RUN_LOCK_FILE:-/tmp/kubein-ablation.lock}"
+command -v flock >/dev/null 2>&1 || {
+  echo "[오류] 동시 실행 방지에 필요한 flock을 찾을 수 없습니다." >&2
+  exit 2
+}
+exec 9>"$RUN_LOCK_FILE"
+if ! flock -n 9; then
+  echo "[오류] 다른 KUBEIN ablation 실행이 이미 진행 중입니다: $RUN_LOCK_FILE" >&2
+  exit 75
+fi
+KUBEIN_ABLATION_LOCK_HELD=1
+export KUBEIN_ABLATION_LOCK_HELD RUN_LOCK_FILE
+
 API_BASE="${API_BASE:-http://localhost:8000}"
 CYCLES="${CYCLES:-5}"
 RESULTS=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCENARIO_DIR="${SCENARIO_DIR:-$REPO_ROOT/cluster-port/sock-shop-scenarios}"
 PRECHECK_SCRIPT="${PRECHECK_SCRIPT:-$SCRIPT_DIR/03-pre-check-cluster.sh}"
 EVAL_SCRIPT="${EVAL_SCRIPT:-$SCRIPT_DIR/04-ablation-eval-cluster.sh}"
 SCENARIO_MANIFEST="${SCENARIO_MANIFEST:-$REPO_ROOT/eval/scenarios.txt}"
+INTEGRITY_SCRIPT="${INTEGRITY_SCRIPT:-$REPO_ROOT/eval/validate-ablation-results.py}"
+SCORING_SCRIPT="${SCORING_SCRIPT:-$REPO_ROOT/eval/score-ablation-results.py}"
+GROUND_TRUTH_FILE="${GROUND_TRUTH_FILE:-$REPO_ROOT/eval/ground_truth.json}"
+EVAL_MODES_CSV="${EVAL_MODES_CSV:-hybrid,dfs_only,llm_only}"
+EXCLUDED_SCENARIOS_CSV="${EXCLUDED_SCENARIOS_CSV-}"
 LATEST_POINTER="$SCENARIO_DIR/results/latest_ablation_dir.txt"
 
-export SCENARIO_DIR API_BASE SCENARIO_MANIFEST  # 하위 스크립트로 전달
+export SCENARIO_DIR API_BASE SCENARIO_MANIFEST EVAL_MODES_CSV
+export EXCLUDED_SCENARIOS_CSV GROUND_TRUTH_FILE
 
 if ! [[ "$CYCLES" =~ ^[1-9][0-9]*$ ]]; then
   echo "[오류] CYCLES는 1 이상의 정수여야 합니다: $CYCLES" >&2
   exit 2
 fi
-if [ ! -f "$PRECHECK_SCRIPT" ] || [ ! -f "$EVAL_SCRIPT" ]; then
+if [ ! -f "$PRECHECK_SCRIPT" ] || [ ! -f "$EVAL_SCRIPT" ] \
+  || [ ! -f "$INTEGRITY_SCRIPT" ] || [ ! -f "$SCORING_SCRIPT" ]; then
   echo "[오류] runner 파일을 찾을 수 없습니다." >&2
   echo "  PRECHECK_SCRIPT=$PRECHECK_SCRIPT" >&2
   echo "  EVAL_SCRIPT=$EVAL_SCRIPT" >&2
+  echo "  INTEGRITY_SCRIPT=$INTEGRITY_SCRIPT" >&2
+  echo "  SCORING_SCRIPT=$SCORING_SCRIPT" >&2
   exit 2
 fi
 if [ ! -f "$SCENARIO_MANIFEST" ]; then
@@ -44,6 +66,20 @@ run_precheck() {
   echo "[경고] pre-check 실패, 60초 후 1회 재시도"
   sleep 60
   bash "$PRECHECK_SCRIPT"
+}
+
+validate_three_mode_integrity() {
+  local args=(
+    "$INTEGRITY_SCRIPT"
+    --manifest "$SCENARIO_MANIFEST"
+    --modes hybrid,dfs_only,llm_only
+    --require-valid
+  )
+  local cycle_dir
+  for cycle_dir in "$@"; do
+    args+=(--cycle-dir "$cycle_dir")
+  done
+  python3 "${args[@]}"
 }
 
 echo "================================================="
@@ -114,6 +150,10 @@ PY
     echo "[오류] cycle $i summary 스키마/20개 scenario 검증 실패" >&2
     exit 1
   fi
+  if ! validate_three_mode_integrity "$LATEST_DIR"; then
+    echo "[오류] cycle $i의 20시나리오/3모드 결과 무결성 검증 실패" >&2
+    exit 1
+  fi
   RESULTS+=("$LATEST_DIR")
 
   echo ">>> [CYCLE $i/$CYCLES] End: $(date +'%Y-%m-%d %H:%M:%S')"
@@ -153,5 +193,32 @@ for r in "${RESULTS[@]}"; do
   cycle_num=$((cycle_num+1))
 done
 
+if [ "$(printf '%s\n' "${RESULTS[@]}" | sort -u | wc -l | tr -d ' ')" -ne "$CYCLES" ]; then
+  echo "[오류] cycle 결과 디렉터리가 중복되었습니다." >&2
+  exit 1
+fi
+
+if ! validate_three_mode_integrity "${RESULTS[@]}"; then
+  echo "[오류] 전체 cycle 20시나리오/3모드 통합 무결성 검증 실패" >&2
+  exit 1
+fi
+
+score_args=(
+  "$SCORING_SCRIPT"
+  --ground-truth "$GROUND_TRUTH_FILE"
+  --manifest "$SCENARIO_MANIFEST"
+  --output-json "$MERGE_DIR/scoring.json"
+  --output-tsv "$MERGE_DIR/scoring.tsv"
+)
+for r in "${RESULTS[@]}"; do
+  score_args+=(--cycle-dir "$r")
+done
+if ! python3 "${score_args[@]}"; then
+  echo "[오류] 결정론적 batch scoring 실패" >&2
+  exit 1
+fi
+
 echo ""
 echo "통합 결과: $MERGE_DIR/_merged_summary.tsv"
+echo "무결성/채점: $MERGE_DIR/scoring.json"
+echo "무결성/채점 TSV: $MERGE_DIR/scoring.tsv"

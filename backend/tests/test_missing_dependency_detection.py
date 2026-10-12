@@ -84,6 +84,24 @@ class MissingDependencyDetectionTests(unittest.TestCase):
             any(result.root_cause_kind == "ConfigMap" for result in results)
         )
 
+    def test_pending_pod_missing_pvc_is_promoted(self) -> None:
+        pod = make_pod(phase="Pending", status="WARNING", reason="Pending")
+        pod.cm_names = []
+        pod.pvc_names = ["missing-pvc"]
+
+        graph = DependencyGraph(make_cache(pod))
+
+        missing = graph.nodes["PVC/default/missing-pvc"]
+        self.assertEqual("ERROR", missing.status)
+        self.assertEqual("Missing", missing.error_reason)
+
+        results = graph.find_root_causes_dfs_only()
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual("PVC", results[0].root_cause_kind)
+        self.assertEqual("missing-pvc", results[0].root_cause_name)
+        self.assertEqual("Missing", results[0].root_cause_reason)
+
+
 
 if __name__ == "__main__":
     unittest.main()
