@@ -19,3 +19,7 @@ backend/chroma_db/
 *.log
 # Direct engine experiment artifacts
 engine-results/
+
+token.md
+cluster-port/sock-shop-scenarios/results/
+*.tar.gz

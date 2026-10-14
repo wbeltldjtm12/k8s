@@ -1,4 +1,4 @@
-# KubeIn
+﻿# KubeIn
 
 Kubernetes 리소스 의존성 그래프를 기반으로 장애 원인과 전파 범위를 분석하고,
 RAG/LLM 설명을 제공하는 FastAPI + Streamlit 애플리케이션입니다.
